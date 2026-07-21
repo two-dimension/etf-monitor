@@ -1,0 +1,12 @@
+{
+  "name": "etf-volume-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "install:frontend": "npm.cmd install --prefix frontend",
+    "test": "powershell -ExecutionPolicy Bypass -File scripts/test.ps1",
+    "build": "npm.cmd run build --prefix frontend"
+  }
+}
