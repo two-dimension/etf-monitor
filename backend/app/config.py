@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import os
+from datetime import time
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
 
 DEFAULT_SYMBOLS = (
+    "588000.SH:科创50ETF华夏,"
     "159915.SZ:创业板ETF易方达,"
-    "510310.SH:沪深300ETF易方达,"
-    "588080.SH:科创50ETF易方达"
+    "510300.SH:沪深300ETF华泰柏瑞"
 )
+_DEFAULT_LATE_SESSION_START = time(14, 30)
 _ENV_LOADED = False
 
 
@@ -67,6 +69,20 @@ def _str_env(name: str, default: str) -> str:
     return default if value is None or value == "" else value
 
 
+def _time_env(name: str, default: time) -> time:
+    _ensure_env_loaded()
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    parts = value.split(":")
+    if len(parts) != 2:
+        return default
+    try:
+        return time(int(parts[0]), int(parts[1]))
+    except ValueError:
+        return default
+
+
 def _bool_env(name: str, default: bool) -> bool:
     _ensure_env_loaded()
     value = os.getenv(name)
@@ -105,6 +121,24 @@ class Settings(BaseModel):
     symbol_name: str = Field(default_factory=lambda: _str_env("ETF_NAME", "创业板ETF易方达"))
     symbols: list[EtfSymbolConfig] = Field(default_factory=_symbols_env)
     kline_period: str = Field(default_factory=lambda: _str_env("KLINE_PERIOD", "15"))
+    late_session_kline_period: str = Field(
+        default_factory=lambda: _str_env("LATE_SESSION_KLINE_PERIOD", "5")
+    )
+    late_session_start_time: time = Field(
+        default_factory=lambda: _time_env(
+            "LATE_SESSION_START_TIME", _DEFAULT_LATE_SESSION_START
+        )
+    )
+    opening_volume_ratio_threshold: float = Field(
+        default_factory=lambda: _float_env(
+            "OPENING_VOLUME_RATIO_THRESHOLD", 1.5
+        )
+    )
+    opening_critical_ratio_threshold: float = Field(
+        default_factory=lambda: _float_env(
+            "OPENING_CRITICAL_RATIO_THRESHOLD", 3.0
+        )
+    )
     timezone: str = Field(default_factory=lambda: _str_env("APP_TIMEZONE", "Asia/Shanghai"))
     db_path: Path = Field(
         default_factory=lambda: Path(_str_env("DB_PATH", "backend/data/etf_monitor.db"))
@@ -113,22 +147,23 @@ class Settings(BaseModel):
         default_factory=lambda: _int_env("POLL_INTERVAL_SECONDS", 60)
     )
     volume_ratio_threshold: float = Field(
-        default_factory=lambda: _float_env("VOLUME_RATIO_THRESHOLD", 2.0)
+        default_factory=lambda: _float_env("VOLUME_RATIO_THRESHOLD", 1.5)
+    )
+    late_session_volume_ratio_threshold: float = Field(
+        default_factory=lambda: _float_env(
+            "LATE_SESSION_VOLUME_RATIO_THRESHOLD", 1.5
+        )
     )
     volume_shrink_ratio_threshold: float = Field(
         default_factory=lambda: _float_env("VOLUME_SHRINK_RATIO_THRESHOLD", 0.5)
     )
-    median_multiplier_threshold: float = Field(
-        default_factory=lambda: _float_env("MEDIAN_MULTIPLIER_THRESHOLD", 1.8)
-    )
-    median_shrink_multiplier_threshold: float = Field(
-        default_factory=lambda: _float_env("MEDIAN_SHRINK_MULTIPLIER_THRESHOLD", 0.5)
-    )
     critical_ratio_threshold: float = Field(
         default_factory=lambda: _float_env("CRITICAL_RATIO_THRESHOLD", 5.0)
     )
-    critical_shrink_ratio_threshold: float = Field(
-        default_factory=lambda: _float_env("CRITICAL_SHRINK_RATIO_THRESHOLD", 0.2)
+    late_session_critical_ratio_threshold: float = Field(
+        default_factory=lambda: _float_env(
+            "LATE_SESSION_CRITICAL_RATIO_THRESHOLD", 4.5
+        )
     )
     rolling_window_min: int = Field(
         default_factory=lambda: _int_env("ROLLING_WINDOW_MIN", 8)
@@ -174,3 +209,34 @@ class Settings(BaseModel):
         if normalized == self.symbol.upper():
             return self.symbol_name
         return symbol
+
+    def is_late_session(self, candle_time) -> bool:
+        """A candle counts as late-session only after the configured start."""
+        if hasattr(candle_time, "time"):
+            candle_time = candle_time.time()
+        return candle_time > self.late_session_start_time
+
+    def kline_period_for(self, candle_time) -> str:
+        if self.is_late_session(candle_time):
+            return self.late_session_kline_period
+        return self.kline_period
+
+    def volume_ratio_threshold_for(self, candle_time) -> float:
+        if self.is_opening_candle(candle_time):
+            return self.opening_volume_ratio_threshold
+        if self.is_late_session(candle_time):
+            return self.late_session_volume_ratio_threshold
+        return self.volume_ratio_threshold
+
+    def critical_ratio_threshold_for(self, candle_time) -> float:
+        if self.is_opening_candle(candle_time):
+            return self.opening_critical_ratio_threshold
+        if self.is_late_session(candle_time):
+            return self.late_session_critical_ratio_threshold
+        return self.critical_ratio_threshold
+
+    def is_opening_candle(self, candle_time) -> bool:
+        """Same-slot candles (9:45, 13:15) compare to the previous trading day."""
+        if hasattr(candle_time, "time"):
+            candle_time = candle_time.time()
+        return candle_time in {time(9, 45), time(13, 15)}

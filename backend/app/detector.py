@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from statistics import median
+from datetime import timedelta
 
 from app.config import Settings
 from app.models import AlertCreate, Candle
@@ -13,68 +13,63 @@ def detect_volume_spike(candles: list[Candle], settings: Settings) -> AlertCreat
     ordered_all = sorted(candles, key=lambda item: item.time)
     latest_day = ordered_all[-1].time.date()
     ordered = [item for item in ordered_all if item.time.date() == latest_day]
-    if len(ordered) < 2:
+    if not ordered:
         return None
 
     current = ordered[-1]
-    previous = ordered[-2]
-    if previous.volume <= 0:
+    if settings.is_opening_candle(current.time):
+        previous = _previous_trading_day_same_slot_candle(ordered_all, current)
+        return _detect_spike_against_previous(current, previous, settings)
+
+    previous = _previous_same_day_candle(ordered, current)
+    if previous is None:
         return None
 
-    ratio = current.volume / previous.volume
-    history = [item.volume for item in ordered[:-1] if item.volume > 0]
-    baseline = _rolling_baseline(history, settings)
+    alert = _detect_spike_against_previous(current, previous, settings)
+    if alert is not None:
+        return alert
 
-    spike = _detect_spike(current.volume, ratio, baseline, settings)
-    if spike:
-        return _alert(current, previous, round(ratio, 2), settings.volume_ratio_threshold, spike)
-
-    shrink = _detect_shrink(current.volume, ratio, baseline, settings)
-    if shrink:
-        return _alert(
-            current,
-            previous,
-            round(ratio, 2),
-            settings.volume_shrink_ratio_threshold,
-            shrink,
-        )
+    if settings.is_late_session(current.time):
+        previous = _previous_trading_day_same_slot_candle(ordered_all, current)
+        return _detect_spike_against_previous(current, previous, settings)
 
     return None
 
 
-def _rolling_baseline(history: list[int], settings: Settings) -> float | None:
-    if len(history) < settings.rolling_window_min:
+def _detect_spike_against_previous(
+    current: Candle,
+    previous: Candle | None,
+    settings: Settings,
+) -> AlertCreate | None:
+    if previous is None or previous.volume <= 0:
         return None
-    window = history[-settings.rolling_window_max :]
-    return float(median(window))
+
+    ratio = current.volume / previous.volume
+
+    spike = _detect_spike(ratio, settings, current.time)
+    if spike:
+        _, severity = spike
+        threshold = (
+            settings.critical_ratio_threshold_for(current.time)
+            if severity == "critical"
+            else settings.volume_ratio_threshold_for(current.time)
+        )
+        return _alert(current, previous, round(ratio, 2), threshold, spike, settings)
+
+    return None
 
 
 def _detect_spike(
-    current_volume: int,
     ratio: float,
-    baseline: float | None,
     settings: Settings,
+    candle_time,
 ) -> tuple[str, str] | None:
-    if ratio < settings.volume_ratio_threshold:
+    volume_threshold = settings.volume_ratio_threshold_for(candle_time)
+    if ratio < volume_threshold:
         return None
-    if baseline and current_volume < baseline * settings.median_multiplier_threshold:
-        return None
-    severity = "critical" if ratio >= settings.critical_ratio_threshold else "warning"
+    critical_threshold = settings.critical_ratio_threshold_for(candle_time)
+    severity = "critical" if ratio >= critical_threshold else "warning"
     return "volume_spike", severity
-
-
-def _detect_shrink(
-    current_volume: int,
-    ratio: float,
-    baseline: float | None,
-    settings: Settings,
-) -> tuple[str, str] | None:
-    if ratio > settings.volume_shrink_ratio_threshold:
-        return None
-    if baseline and current_volume > baseline * settings.median_shrink_multiplier_threshold:
-        return None
-    severity = "critical" if ratio <= settings.critical_shrink_ratio_threshold else "warning"
-    return "volume_shrink", severity
 
 
 def _alert(
@@ -83,17 +78,25 @@ def _alert(
     rounded_ratio: float,
     threshold: float,
     detected: tuple[str, str],
+    settings: Settings,
 ) -> AlertCreate:
     alert_type, severity = detected
+    period_label = f"{settings.kline_period_for(current.time)}分钟"
+    current_period = _kline_period_label(current.time, settings)
+    previous_period = _kline_period_label(previous.time, settings)
+    if current.time.date() != previous.time.date():
+        previous_label = f"前一交易日同一时间点 {previous.time:%H:%M}"
+    else:
+        previous_label = f"前一根 {previous.time:%H:%M}"
     if alert_type == "volume_shrink":
         message = (
-            f"{current.symbol} 15分钟成交量缩至前一根 "
-            f"{rounded_ratio:.2f} 倍，当前量 {current.volume}，前一根 {previous.volume}"
+            f"{current.symbol} {period_label}（{current_period}）成交量缩至{previous_label} "
+            f"{rounded_ratio:.2f} 倍，当前量 {current.volume}，{previous_label}（{previous_period}） {previous.volume}"
         )
     else:
         message = (
-            f"{current.symbol} 15分钟成交量放大 "
-            f"{rounded_ratio:.2f} 倍，当前量 {current.volume}，前一根 {previous.volume}"
+            f"{current.symbol} {period_label}（{current_period}）成交量放大 "
+            f"{rounded_ratio:.2f} 倍，当前量 {current.volume}，{previous_label}（{previous_period}） {previous.volume}"
         )
     return AlertCreate(
         symbol=current.symbol,
@@ -107,3 +110,45 @@ def _alert(
         severity=severity,
         message=message,
     )
+
+
+def _previous_trading_day_same_slot_candle(
+    candles,
+    current,
+):
+    """Find the same time on the most recent prior trading day."""
+    previous_dates = sorted(
+        {item.time.date() for item in candles if item.time.date() < current.time.date()},
+        reverse=True,
+    )
+    if not previous_dates:
+        return None
+    previous_date = previous_dates[0]
+    matches = [
+        item
+        for item in candles
+        if item.time.date() == previous_date and item.time.time() == current.time.time()
+        and item.kline_period == current.kline_period
+    ]
+    if not matches:
+        return None
+    return matches[-1]
+
+
+def _previous_same_day_candle(candles, current):
+    matches = [
+        item
+        for item in candles
+        if item.time.date() == current.time.date()
+        and item.time < current.time
+        and item.kline_period == current.kline_period
+    ]
+    if not matches:
+        return None
+    return matches[-1]
+
+
+def _kline_period_label(candle_time, settings: Settings) -> str:
+    period = int(settings.kline_period_for(candle_time))
+    end_time = candle_time + timedelta(minutes=period)
+    return f"{candle_time:%H:%M}-{end_time:%H:%M}"

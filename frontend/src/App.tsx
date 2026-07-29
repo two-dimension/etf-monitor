@@ -176,7 +176,7 @@ export default function App() {
           ) : (
             <div className="quiet-card">
               <span>暂无异动</span>
-              <p>最近一根已完成 K 线没有触发放量或缩量阈值。</p>
+              <p>最近一根已完成 K 线没有触发放量阈值。</p>
             </div>
           )}
         </aside>

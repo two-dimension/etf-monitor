@@ -1,6 +1,6 @@
 # ETF 当日成交量异动监控系统
 
-面向易方达旗下多只 ETF 的 15 分钟 K 线价格和成交量异动监控台。当前默认监控 `159915.SZ`（创业板ETF易方达）、`510310.SH`（沪深300ETF易方达）和 `588080.SH`（科创50ETF易方达）。后端使用 AkShare 拉取 ETF 分钟行情，成功拉取后会把 K 线保存到本地 SQLite；当 AkShare 不稳定时，接口会回退展示本地缓存，前端状态会显示“本地缓存”。
+面向多只 A 股 ETF 的 15 分钟 K 线价格和成交量异动监控台。当前默认监控 `159915.SZ`（创业板ETF易方达）、`510310.SH`（沪深300ETF易方达）、`588080.SH`（科创50ETF易方达）、`588000.SH`（科创50ETF华夏）和 `510300.SH`（沪深300ETF华泰柏瑞）。后端使用 AkShare 拉取 ETF 分钟行情，成功拉取后会把 K 线保存到本地 SQLite；当 AkShare 不稳定时，接口会回退展示本地缓存，前端状态会显示“本地缓存”。
 
 ## 一键运行
 
@@ -17,7 +17,7 @@ npm.cmd install --prefix frontend
 npm.cmd run dev
 ```
 
-打开 `http://127.0.0.1:5173` 查看监控台。后端 API 文档在 `http://127.0.0.1:8000/docs`。
+打开 `http://127.0.0.1:5174` 查看监控台。后端 API 文档在 `http://127.0.0.1:8000/docs`。
 
 也可以继续使用 PowerShell 脚本：
 
@@ -41,14 +41,13 @@ scripts/
 ## 异动规则
 
 - 监控标的由 `ETF_SYMBOLS` 配置，格式为 `代码:名称,代码:名称`。
-- 当前默认标的：`159915.SZ:创业板ETF易方达,510310.SH:沪深300ETF易方达,588080.SH:科创50ETF易方达`。
+- 当前默认标的：`159915.SZ:创业板ETF易方达,510310.SH:沪深300ETF易方达,588080.SH:科创50ETF易方达,588000.SH:科创50ETF华夏,510300.SH:沪深300ETF华泰柏瑞`。
 - 优先使用 AkShare `fund_etf_hist_min_em(symbol="纯数字代码", period="15", adjust="")`；若东财分钟接口不可用，会自动回退到 AkShare `stock_zh_a_minute(symbol="sz/sh代码", period="15", adjust="")`。
 - 只评估已完成的 15 分钟 K 线；每次拉取后会回扫最新交易日内尚未告警过的 K 线，避免启动晚或数据源恢复后漏掉盘中异动。
 - 前端可切换监控标的，价格 K 线图和成交量图只展示所选 ETF 最新交易日的当日 15 分钟 K 线。
-- 放量：当前成交量 / 前一根成交量 >= `VOLUME_RATIO_THRESHOLD`，默认 `2.0`。
-- 缩量：当前成交量 / 前一根成交量 <= `VOLUME_SHRINK_RATIO_THRESHOLD`，默认 `0.5`。
-- 当历史 K 线数量足够时，放量还需 >= 最近窗口成交量中位数 * `MEDIAN_MULTIPLIER_THRESHOLD`；缩量还需 <= 最近窗口成交量中位数 * `MEDIAN_SHRINK_MULTIPLIER_THRESHOLD`。
-- 放量倍数 >= `CRITICAL_RATIO_THRESHOLD`，或缩量比例 <= `CRITICAL_SHRINK_RATIO_THRESHOLD`，标记为 `critical`，否则为 `warning`。
+- 放量：当前成交量 / 前一根成交量 >= `VOLUME_RATIO_THRESHOLD`，默认 `1.7`；每天开盘第一根 K 线会与上一交易日最后一根 K 线成交量比较。
+- 放量倍数 >= `CRITICAL_RATIO_THRESHOLD` 时标记为 `critical`，否则为 `warning`。
+- 缩量不再生成告警，也不会触发邮件推送。
 - 告警按 `symbol + candle_time` 去重，避免重复写入和重复邮件推送；后台轮询会依次检查全部配置标的。
 - `last_updated` 返回最新已完成 K 线时间。
 
@@ -83,7 +82,7 @@ SMTP_STARTTLS=false
 SMTP_TIMEOUT_SECONDS=10
 ```
 
-当任一配置标的新增一条放量或缩量异动告警时，会通过 SMTP 给 `SMTP_TO` 中的收件人发送邮件。同一 `symbol + candle_time` 的告警只记录一次，也只发送一次邮件。若 SMTP 发送失败，后端只记录日志，不会中断行情拉取、缓存或告警写入。
+后台轮询全部标的时，会把本轮新增的放量异动合并到同一封邮件，只包含有异动的标的；若本轮全部标的均无异动，则把无异动状态合并到同一封邮件。收盘后会额外发送一封当天总结，列出全日异动；没有异动也会发送“无异动”总结。同一 `symbol + candle_time` 的告警只记录一次，也只发送一次邮件；同一交易日的收盘总结只发送一次。若 SMTP 发送失败，后端只记录日志，不会中断行情拉取、缓存或告警写入。
 
 常见邮箱服务通常要求使用“SMTP 授权码”而不是登录密码，例如 QQ 邮箱、163 邮箱和企业邮箱。
 

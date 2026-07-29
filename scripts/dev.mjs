@@ -3,6 +3,8 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import { normalizeSpawnCommand } from "./devProcess.mjs";
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const isWindows = process.platform === "win32";
 const npmCommand = isWindows ? "npm.cmd" : "npm";
@@ -25,14 +27,14 @@ const children = [
     "--host",
     "127.0.0.1",
     "--port",
-    "8000",
+    "8001",
   ]),
   run("frontend", npmCommand, ["run", "dev", "--prefix", "frontend"]),
 ];
 
 console.log("ETF monitor is starting in one terminal.");
 console.log("Frontend: http://127.0.0.1:5173");
-console.log("Backend:  http://127.0.0.1:8000/docs");
+console.log("Backend:  http://127.0.0.1:8001/docs");
 console.log("Press Ctrl+C to stop both services.");
 
 let shuttingDown = false;
@@ -50,7 +52,8 @@ for (const child of children) {
 }
 
 function run(name, command, args) {
-  const child = spawn(command, args, {
+  const normalized = normalizeSpawnCommand(command, args);
+  const child = spawn(normalized.command, normalized.args, {
     cwd: root,
     env: sharedEnv,
     stdio: ["ignore", "pipe", "pipe"],

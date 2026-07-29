@@ -2,20 +2,49 @@ from app import config
 from app.config import Settings
 
 
+def test_default_volume_ratio_threshold_is_1_5(monkeypatch):
+    monkeypatch.setattr(config, "_ENV_LOADED", False)
+    monkeypatch.setattr(config, "_env_file_candidates", lambda: [])
+    monkeypatch.delenv("VOLUME_RATIO_THRESHOLD", raising=False)
+
+    settings = Settings()
+
+    assert settings.volume_ratio_threshold == 1.5
+
+
 def test_settings_loads_values_from_dotenv_file(tmp_path, monkeypatch):
     (tmp_path / ".env").write_text(
-        "ETF_SYMBOL=510300.SH\nVOLUME_RATIO_THRESHOLD=4.2\n",
+        "\n".join(
+            [
+                "ETF_SYMBOL=510300.SH",
+                "VOLUME_RATIO_THRESHOLD=4.2",
+                "HISTORICAL_AVG_DAYS=5",
+                "ROLLING_WINDOW_MIN=8",
+                "ROLLING_WINDOW_MAX=20",
+            ]
+        ),
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(config, "_ENV_LOADED", False)
     monkeypatch.delenv("ETF_SYMBOL", raising=False)
     monkeypatch.delenv("VOLUME_RATIO_THRESHOLD", raising=False)
+    monkeypatch.delenv("HISTORICAL_AVG_DAYS", raising=False)
+    monkeypatch.delenv("ROLLING_WINDOW_MIN", raising=False)
+    monkeypatch.delenv("ROLLING_WINDOW_MAX", raising=False)
+    monkeypatch.delenv("LATE_SESSION_VOLUME_RATIO_THRESHOLD", raising=False)
+    monkeypatch.delenv("LATE_SESSION_KLINE_PERIOD", raising=False)
 
     settings = Settings()
 
     assert settings.symbol == "510300.SH"
     assert settings.volume_ratio_threshold == 4.2
+    assert not hasattr(settings, "historical_average_days")
+    assert not hasattr(settings, "median_multiplier_threshold")
+    assert settings.rolling_window_min == 8
+    assert settings.rolling_window_max == 20
+    assert settings.late_session_volume_ratio_threshold == 1.5
+    assert settings.late_session_kline_period == "5"
 
 
 def test_settings_loads_smtp_values_from_dotenv_file(tmp_path, monkeypatch):
@@ -64,6 +93,20 @@ def test_settings_loads_smtp_values_from_dotenv_file(tmp_path, monkeypatch):
     assert settings.smtp_use_ssl is True
     assert settings.smtp_starttls is False
     assert settings.smtp_timeout_seconds == 8
+
+
+def test_default_monitored_symbols_include_requested_etfs(monkeypatch):
+    monkeypatch.setattr(config, "_ENV_LOADED", False)
+    monkeypatch.setattr(config, "_env_file_candidates", lambda: [])
+    monkeypatch.delenv("ETF_SYMBOLS", raising=False)
+
+    settings = Settings()
+
+    assert [(item.symbol, item.name) for item in settings.monitored_symbols()] == [
+        ("588000.SH", "科创50ETF华夏"),
+        ("159915.SZ", "创业板ETF易方达"),
+        ("510300.SH", "沪深300ETF华泰柏瑞"),
+    ]
 
 
 def test_settings_loads_monitored_symbols_from_dotenv_file(tmp_path, monkeypatch):

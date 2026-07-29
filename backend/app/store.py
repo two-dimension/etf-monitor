@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from datetime import UTC, datetime, time
 from pathlib import Path
 
 from app.models import AlertCreate, AlertLog, Candle
+
+SAME_SLOT_COMPARISON_TIMES = {
+    time(9, 45),
+    time(13, 15),
+}
 
 
 class AlertStore:
@@ -51,6 +56,7 @@ class AlertStore:
                     symbol TEXT NOT NULL,
                     name TEXT NOT NULL,
                     candle_time TEXT NOT NULL,
+                    kline_period TEXT NOT NULL DEFAULT '15',
                     open REAL NOT NULL,
                     high REAL NOT NULL,
                     low REAL NOT NULL,
@@ -58,7 +64,20 @@ class AlertStore:
                     volume INTEGER NOT NULL,
                     amount REAL NOT NULL,
                     cached_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY(symbol, candle_time)
+                    PRIMARY KEY(symbol, candle_time, kline_period)
+                )
+                """
+            )
+            _ensure_candles_period_key(connection)
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS notification_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    candle_time TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(symbol, candle_time, event_type)
                 )
                 """
             )
@@ -114,9 +133,63 @@ class AlertStore:
             ).fetchall()
         return [_alert_from_row(row) for row in rows]
 
+    def list_alerts_for_date(self, target_date) -> list[AlertLog]:
+        start = datetime.combine(target_date, datetime.min.time()).isoformat()
+        end = datetime.combine(target_date, datetime.max.time()).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM alerts
+                WHERE candle_time >= ?
+                AND candle_time <= ?
+                ORDER BY candle_time ASC, symbol ASC
+                """,
+                (start, end),
+            ).fetchall()
+        return [_alert_from_row(row) for row in rows]
+
+    def list_alerts_for_candle_time(self, candle_time: datetime) -> list[AlertLog]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM alerts
+                WHERE candle_time = ?
+                ORDER BY symbol ASC
+                """,
+                (candle_time.isoformat(),),
+            ).fetchall()
+        return [_alert_from_row(row) for row in rows]
+
     def latest_alert(self, symbol: str) -> AlertLog | None:
         alerts = self.list_alerts(symbol, limit=1)
         return alerts[0] if alerts else None
+
+    def save_notification_event_with_status(
+        self,
+        symbol: str,
+        candle_time: datetime,
+        event_type: str,
+    ) -> tuple[datetime, bool]:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO notification_events (
+                    symbol, candle_time, event_type
+                ) VALUES (?, ?, ?)
+                """,
+                (symbol, candle_time.isoformat(), event_type),
+            )
+            inserted = cursor.rowcount > 0
+            row = connection.execute(
+                """
+                SELECT created_at FROM notification_events
+                WHERE symbol = ? AND candle_time = ? AND event_type = ?
+                """,
+                (symbol, candle_time.isoformat(), event_type),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("failed to persist notification event")
+        return _parse_db_timestamp(row["created_at"]), inserted
 
     def save_candles(self, candles: list[Candle]) -> None:
         self.upsert_candles(candles)
@@ -128,9 +201,9 @@ class AlertStore:
             connection.executemany(
                 """
                 INSERT INTO candles (
-                    symbol, name, candle_time, open, high, low, close, volume, amount
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(symbol, candle_time) DO UPDATE SET
+                    symbol, name, candle_time, kline_period, open, high, low, close, volume, amount
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, candle_time, kline_period) DO UPDATE SET
                     name = excluded.name,
                     open = excluded.open,
                     high = excluded.high,
@@ -145,6 +218,7 @@ class AlertStore:
                         candle.symbol,
                         candle.name,
                         candle.time.isoformat(),
+                        candle.kline_period,
                         candle.open,
                         candle.high,
                         candle.low,
@@ -155,6 +229,7 @@ class AlertStore:
                     for candle in candles
                 ],
             )
+            _sync_alert_volumes(connection, candles)
 
     def list_candles(self, symbol: str, limit: int = 120) -> list[Candle]:
         with self._connect() as connection:
@@ -163,10 +238,10 @@ class AlertStore:
                 SELECT * FROM (
                     SELECT * FROM candles
                     WHERE symbol = ?
-                    ORDER BY candle_time DESC
+                    ORDER BY candle_time DESC, CAST(kline_period AS INTEGER) DESC
                     LIMIT ?
                 )
-                ORDER BY candle_time ASC
+                ORDER BY candle_time ASC, CAST(kline_period AS INTEGER) ASC
                 """,
                 (symbol, limit),
             ).fetchall()
@@ -182,7 +257,7 @@ class AlertStore:
             ).fetchone()
         if row is None or row["cached_at"] is None:
             return None
-        return _parse_datetime(row["cached_at"])
+        return _parse_db_timestamp(row["cached_at"])
 
 
 class CandleCache:
@@ -204,6 +279,7 @@ class CandleCache:
                     symbol TEXT NOT NULL,
                     name TEXT NOT NULL,
                     candle_time TEXT NOT NULL,
+                    kline_period TEXT NOT NULL DEFAULT '15',
                     open REAL NOT NULL,
                     high REAL NOT NULL,
                     low REAL NOT NULL,
@@ -211,10 +287,11 @@ class CandleCache:
                     volume INTEGER NOT NULL,
                     amount REAL NOT NULL,
                     cached_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY(symbol, candle_time)
+                    PRIMARY KEY(symbol, candle_time, kline_period)
                 )
                 """
             )
+            _ensure_candles_period_key(connection)
 
     def upsert_candles(self, candles: list[Candle]) -> None:
         if not candles:
@@ -223,9 +300,9 @@ class CandleCache:
             connection.executemany(
                 """
                 INSERT INTO candles (
-                    symbol, name, candle_time, open, high, low, close, volume, amount
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(symbol, candle_time) DO UPDATE SET
+                    symbol, name, candle_time, kline_period, open, high, low, close, volume, amount
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, candle_time, kline_period) DO UPDATE SET
                     name = excluded.name,
                     open = excluded.open,
                     high = excluded.high,
@@ -240,6 +317,7 @@ class CandleCache:
                         candle.symbol,
                         candle.name,
                         candle.time.isoformat(),
+                        candle.kline_period,
                         candle.open,
                         candle.high,
                         candle.low,
@@ -258,10 +336,10 @@ class CandleCache:
                 SELECT * FROM (
                     SELECT * FROM candles
                     WHERE symbol = ?
-                    ORDER BY candle_time DESC
+                    ORDER BY candle_time DESC, CAST(kline_period AS INTEGER) DESC
                     LIMIT ?
                 )
-                ORDER BY candle_time ASC
+                ORDER BY candle_time ASC, CAST(kline_period AS INTEGER) ASC
                 """,
                 (symbol, limit),
             ).fetchall()
@@ -277,7 +355,92 @@ class CandleCache:
             ).fetchone()
         if row is None or row["cached_at"] is None:
             return None
-        return _parse_datetime(row["cached_at"])
+        return _parse_db_timestamp(row["cached_at"])
+
+
+def _sync_alert_volumes(connection: sqlite3.Connection, candles: list[Candle]) -> None:
+    seen = {
+        (candle.symbol, candle.time.isoformat(), candle.kline_period)
+        for candle in candles
+    }
+    for symbol, candle_time, kline_period in seen:
+        current = connection.execute(
+            """
+            SELECT volume FROM candles
+            WHERE symbol = ? AND candle_time = ? AND kline_period = ?
+            """,
+            (symbol, candle_time, kline_period),
+        ).fetchone()
+        previous = _previous_candle_for_alert_sync(
+            connection, symbol, candle_time, kline_period
+        )
+        if current is None or previous is None or previous["volume"] <= 0:
+            continue
+
+        volume = current["volume"]
+        prev_volume = previous["volume"]
+        ratio = round(volume / prev_volume, 2)
+        connection.execute(
+            """
+            UPDATE alerts
+            SET volume = ?,
+                prev_volume = ?,
+                ratio = ?,
+                message = symbol || ' 15分钟成交量放大 ' || printf('%.2f', ?)
+                    || ' 倍，当前量 ' || ? || '，' || ? || ' ' || ?
+            WHERE symbol = ? AND candle_time = ? AND alert_type = 'volume_spike'
+            """,
+            (
+                volume,
+                prev_volume,
+                ratio,
+                ratio,
+                volume,
+                _comparison_message_label(candle_time),
+                prev_volume,
+                symbol,
+                candle_time,
+            ),
+        )
+
+
+def _previous_candle_for_alert_sync(
+    connection: sqlite3.Connection, symbol: str, candle_time: str, kline_period: str
+) -> sqlite3.Row | None:
+    parsed_candle_time = _parse_datetime(candle_time)
+    if _uses_previous_trading_day_same_slot(parsed_candle_time):
+        return connection.execute(
+            """
+            SELECT volume FROM candles
+            WHERE symbol = ?
+            AND kline_period = ?
+            AND candle_time < ?
+            AND substr(candle_time, 12, 5) = ?
+            ORDER BY candle_time DESC
+            LIMIT 1
+            """,
+            (symbol, kline_period, candle_time, f"{parsed_candle_time:%H:%M}"),
+        ).fetchone()
+    return connection.execute(
+        """
+        SELECT volume FROM candles
+        WHERE symbol = ? AND kline_period = ? AND candle_time < ?
+        ORDER BY candle_time DESC
+        LIMIT 1
+        """,
+        (symbol, kline_period, candle_time),
+    ).fetchone()
+
+
+def _comparison_message_label(candle_time: str) -> str:
+    parsed_candle_time = _parse_datetime(candle_time)
+    if _uses_previous_trading_day_same_slot(parsed_candle_time):
+        return f"前一交易日{parsed_candle_time:%H:%M}"
+    return "前一根"
+
+
+def _uses_previous_trading_day_same_slot(candle_time: datetime) -> bool:
+    return candle_time.time() in SAME_SLOT_COMPARISON_TIMES
 
 
 def _alert_from_row(row: sqlite3.Row) -> AlertLog:
@@ -293,7 +456,7 @@ def _alert_from_row(row: sqlite3.Row) -> AlertLog:
         threshold=row["threshold"],
         severity=row["severity"],
         message=row["message"],
-        created_at=_parse_datetime(row["created_at"]),
+        created_at=_parse_db_timestamp(row["created_at"]),
     )
 
 
@@ -308,11 +471,19 @@ def _candle_from_row(row: sqlite3.Row) -> Candle:
         close=row["close"],
         volume=row["volume"],
         amount=row["amount"],
+        kline_period=row["kline_period"] if "kline_period" in row.keys() else "15",
     )
 
 
 def _parse_datetime(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _parse_db_timestamp(value: str) -> datetime:
+    parsed = _parse_datetime(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 def _ensure_column(
@@ -327,3 +498,61 @@ def _ensure_column(
     }
     if column_name not in columns:
         connection.execute(ddl)
+
+
+def _ensure_candles_period_key(connection: sqlite3.Connection) -> None:
+    columns = connection.execute("PRAGMA table_info(candles)").fetchall()
+    column_names = {row["name"] for row in columns}
+    pk_columns = [row["name"] for row in columns if row["pk"]]
+    if "kline_period" in column_names and pk_columns == [
+        "symbol",
+        "candle_time",
+        "kline_period",
+    ]:
+        return
+
+    connection.execute("ALTER TABLE candles RENAME TO candles_old")
+    connection.execute(
+        """
+        CREATE TABLE candles (
+            symbol TEXT NOT NULL,
+            name TEXT NOT NULL,
+            candle_time TEXT NOT NULL,
+            kline_period TEXT NOT NULL DEFAULT '15',
+            open REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            close REAL NOT NULL,
+            volume INTEGER NOT NULL,
+            amount REAL NOT NULL,
+            cached_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(symbol, candle_time, kline_period)
+        )
+        """
+    )
+    if "kline_period" in column_names:
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO candles (
+                symbol, name, candle_time, kline_period, open, high, low, close,
+                volume, amount, cached_at
+            )
+            SELECT symbol, name, candle_time, kline_period, open, high, low, close,
+                volume, amount, cached_at
+            FROM candles_old
+            """
+        )
+    else:
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO candles (
+                symbol, name, candle_time, kline_period, open, high, low, close,
+                volume, amount, cached_at
+            )
+            SELECT symbol, name, candle_time,
+                CASE WHEN time(candle_time) > '14:30:00' THEN '5' ELSE '15' END,
+                open, high, low, close, volume, amount, cached_at
+            FROM candles_old
+            """
+        )
+    connection.execute("DROP TABLE candles_old")

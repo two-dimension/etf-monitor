@@ -1,0 +1,16 @@
+ETF monitor is starting in one terminal.
+Frontend: http://127.0.0.1:5173
+Backend:  http://127.0.0.1:8001/docs
+Press Ctrl+C to stop both services.
+[backend] INFO:     Will watch for changes in these directories: ['D:\\实习任务\\etf_monitor']
+[backend] INFO:     Uvicorn running on http://127.0.0.1:8001 (Press CTRL+C to quit)
+[backend] INFO:     Started reloader process [14172] using WatchFiles
+[frontend] > etf-volume-monitor-frontend@0.1.0 dev
+[frontend] > vite --host 0.0.0.0
+[backend] INFO:     Started server process [19644]
+[backend] INFO:     Waiting for application startup.
+[backend] INFO:     Application startup complete.
+[frontend]   [32m[1mVITE[22m v6.4.3[39m  [2mready in [0m[1m581[22m[2m[0m ms[22m
+[frontend]   [32m➜[39m  [1mLocal[22m:   [36mhttp://localhost:[1m5174[22m/[39m
+[frontend]   [32m➜[39m  [1mNetwork[22m: [36mhttp://10.10.10.97:[1m5174[22m/[39m
+[backend] INFO:     127.0.0.1:56402 - "GET /api/monitor/symbols HTTP/1.1" 200 OK

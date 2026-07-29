@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict
 
 
 Severity = Literal["warning", "critical"]
-AlertType = Literal["volume_spike", "volume_shrink"]
+AlertType = Literal["volume_spike"]
 DataStatus = Literal["live", "cached", "degraded", "empty"]
 
 
@@ -23,6 +23,7 @@ class Candle(BaseModel):
     close: float
     volume: int
     amount: float
+    kline_period: str = "15"
 
 
 class AlertCreate(BaseModel):
