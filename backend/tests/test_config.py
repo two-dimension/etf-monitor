@@ -1,15 +1,25 @@
+from datetime import time
+
 from app import config
 from app.config import Settings
 
 
-def test_default_volume_ratio_threshold_is_1_5(monkeypatch):
+def test_default_volume_ratio_thresholds_match_intraday_rules(monkeypatch):
     monkeypatch.setattr(config, "_ENV_LOADED", False)
     monkeypatch.setattr(config, "_env_file_candidates", lambda: [])
     monkeypatch.delenv("VOLUME_RATIO_THRESHOLD", raising=False)
+    monkeypatch.delenv("OPENING_VOLUME_RATIO_THRESHOLD", raising=False)
+    monkeypatch.delenv("LATE_SESSION_VOLUME_RATIO_THRESHOLD", raising=False)
+    monkeypatch.delenv("CANDLE_COMPLETION_DELAY_SECONDS", raising=False)
+    monkeypatch.delenv("NO_ANOMALY_CONFIRMATION_DELAY_SECONDS", raising=False)
 
     settings = Settings()
 
-    assert settings.volume_ratio_threshold == 1.5
+    assert settings.opening_volume_ratio_threshold == 1.15
+    assert settings.volume_ratio_threshold == 1.3
+    assert settings.late_session_volume_ratio_threshold == 1.3
+    assert settings.candle_completion_delay_seconds == 60
+    assert settings.no_anomaly_confirmation_delay_seconds == 90
 
 
 def test_settings_loads_values_from_dotenv_file(tmp_path, monkeypatch):
@@ -43,7 +53,7 @@ def test_settings_loads_values_from_dotenv_file(tmp_path, monkeypatch):
     assert not hasattr(settings, "median_multiplier_threshold")
     assert settings.rolling_window_min == 8
     assert settings.rolling_window_max == 20
-    assert settings.late_session_volume_ratio_threshold == 1.5
+    assert settings.late_session_volume_ratio_threshold == 1.3
     assert settings.late_session_kline_period == "5"
 
 
@@ -95,6 +105,29 @@ def test_settings_loads_smtp_values_from_dotenv_file(tmp_path, monkeypatch):
     assert settings.smtp_timeout_seconds == 8
 
 
+def test_settings_loads_symbol_first_candle_times_from_dotenv_file(
+    tmp_path, monkeypatch
+):
+    (tmp_path / ".env").write_text(
+        "SYMBOL_FIRST_CANDLE_TIMES=513310.SH:10:45,159915.SZ:09:45\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(config, "_ENV_LOADED", False)
+    monkeypatch.delenv("SYMBOL_FIRST_CANDLE_TIMES", raising=False)
+
+    settings = Settings()
+
+    assert settings.first_completed_candle_time_for("513310.SH") == time(10, 45)
+    assert settings.first_completed_candle_time_for("159915.SZ") == time(9, 45)
+    assert settings.should_wait_for_symbol_at(
+        "513310.SH", time(10, 30)
+    ) is False
+    assert settings.should_wait_for_symbol_at(
+        "513310.SH", time(10, 45)
+    ) is True
+
+
 def test_default_monitored_symbols_include_requested_etfs(monkeypatch):
     monkeypatch.setattr(config, "_ENV_LOADED", False)
     monkeypatch.setattr(config, "_env_file_candidates", lambda: [])
@@ -106,6 +139,7 @@ def test_default_monitored_symbols_include_requested_etfs(monkeypatch):
         ("588000.SH", "科创50ETF华夏"),
         ("159915.SZ", "创业板ETF易方达"),
         ("510300.SH", "沪深300ETF华泰柏瑞"),
+        ("513310.SH", "中韩半导体ETF华泰柏瑞"),
     ]
 
 

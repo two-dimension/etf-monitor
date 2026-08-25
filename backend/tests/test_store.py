@@ -5,7 +5,7 @@ from app.models import AlertCreate, Candle
 from app.store import AlertStore
 
 
-def candle(time: str, volume: int) -> Candle:
+def candle(time: str, volume: int, amount: float | None = None) -> Candle:
     return Candle(
         symbol="159915.SZ",
         name="创业板ETF易方达",
@@ -15,7 +15,7 @@ def candle(time: str, volume: int) -> Candle:
         low=0.9,
         close=1.05,
         volume=volume,
-        amount=volume * 1.0,
+        amount=amount if amount is not None else volume * 1.0,
     )
 
 
@@ -100,6 +100,22 @@ def test_store_upserts_and_lists_cached_candles_by_symbol(tmp_path):
     assert [item.volume for item in candles] == [1000, 1500, 1600]
 
 
+def test_store_keeps_larger_cached_amount_when_later_update_is_partial(tmp_path):
+    store = AlertStore(tmp_path / "alerts.db")
+
+    store.save_candles(
+        [candle("2026-08-07T11:00:00", 114_719_600, amount=413_254_705)]
+    )
+    store.save_candles(
+        [candle("2026-08-07T11:00:00", 1_245_100, amount=4_486_682.6542)]
+    )
+
+    [saved_candle] = store.list_candles("159915.SZ", limit=10)
+
+    assert saved_candle.volume == 114_719_600
+    assert saved_candle.amount == 413_254_705
+
+
 def test_store_syncs_alert_volumes_when_cached_candles_change(tmp_path):
     store = AlertStore(tmp_path / "alerts.db")
     candle_time = datetime.fromisoformat("2026-07-21T10:00:00")
@@ -117,6 +133,65 @@ def test_store_syncs_alert_volumes_when_cached_candles_change(tmp_path):
     assert saved_alert.volume == 420000
     assert saved_alert.prev_volume == 120000
     assert saved_alert.ratio == 3.5
+
+
+def test_store_syncs_alert_metric_from_cached_amount_not_volume(tmp_path):
+    store = AlertStore(tmp_path / "alerts.db")
+    candle_time = datetime.fromisoformat("2026-07-21T10:00:00")
+    store.save_alert(
+        AlertCreate(
+            symbol="159915.SZ",
+            name="创业板ETF易方达",
+            candle_time=candle_time,
+            volume=1_500_000,
+            prev_volume=1_000_000,
+            ratio=1.5,
+            threshold=1.3,
+            severity="warning",
+            message="159915.SZ 15分钟成交额放大 1.50 倍",
+        )
+    )
+
+    store.save_candles(
+        [
+            candle("2026-07-21T09:45:00", 10_000, amount=1_000_000),
+            candle("2026-07-21T10:00:00", 20_000, amount=1_500_000),
+        ]
+    )
+
+    [saved_alert] = store.list_alerts("159915.SZ", limit=10)
+
+    assert saved_alert.volume == 1_500_000
+    assert saved_alert.prev_volume == 1_000_000
+    assert saved_alert.ratio == 1.5
+    assert "成交额放大" in saved_alert.message
+
+
+def test_store_removes_alert_when_final_amount_no_longer_meets_threshold(tmp_path):
+    store = AlertStore(tmp_path / "alerts.db")
+    candle_time = datetime.fromisoformat("2026-08-07T11:00:00")
+    store.save_alert(
+        AlertCreate(
+            symbol="159915.SZ",
+            name="ETF A",
+            candle_time=candle_time,
+            volume=4_480_932,
+            prev_volume=2_076_972,
+            ratio=2.16,
+            threshold=1.3,
+            severity="warning",
+            message="partial candle false positive",
+        )
+    )
+
+    store.save_candles(
+        [
+            candle("2026-08-07T10:45:00", 128_894_000, amount=465_143_262),
+            candle("2026-08-07T11:00:00", 114_719_600, amount=413_254_705),
+        ]
+    )
+
+    assert store.list_alerts("159915.SZ", limit=10) == []
 
 
 def test_store_syncs_first_candle_alert_against_previous_trading_day_same_slot(
@@ -184,3 +259,38 @@ def test_store_syncs_late_session_start_alert_against_same_day_previous_15m_cand
     assert saved_alert.volume == 1800
     assert saved_alert.prev_volume == 100
     assert saved_alert.ratio == 18.0
+
+
+def test_store_syncs_regular_alert_against_previous_day_same_slot_when_intraday_ratio_misses_threshold(
+    tmp_path,
+):
+    store = AlertStore(tmp_path / "alerts.db")
+    candle_time = datetime.fromisoformat("2026-07-29T10:15:00")
+    store.save_alert(
+        AlertCreate(
+            symbol="159915.SZ",
+            name="创业板ETF易方达",
+            candle_time=candle_time,
+            volume=136_512_700,
+            prev_volume=81_134_800,
+            ratio=1.68,
+            threshold=1.3,
+            severity="warning",
+            message="159915.SZ 15分钟成交量放大 1.68 倍",
+        )
+    )
+
+    store.save_candles(
+        [
+            candle("2026-07-28T10:15:00", 81_134_800),
+            candle("2026-07-29T10:00:00", 197_485_700),
+            candle("2026-07-29T10:15:00", 136_512_700),
+        ]
+    )
+
+    [saved_alert] = store.list_alerts("159915.SZ", limit=10)
+
+    assert saved_alert.volume == 136_512_700
+    assert saved_alert.prev_volume == 81_134_800
+    assert saved_alert.ratio == 1.68
+    assert "前一交易日10:15" in saved_alert.message

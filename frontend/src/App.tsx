@@ -87,7 +87,7 @@ export default function App() {
   const currentAlert = snapshot?.current_alert ?? null;
   const status = snapshot?.data_status ?? "empty";
   const StatusIcon = statusIcon[status];
-  const volumeDelta = useMemo(() => {
+  const amountDelta = useMemo(() => {
     if (!currentAlert) return null;
     return currentAlert.volume - currentAlert.prev_volume;
   }, [currentAlert]);
@@ -99,13 +99,13 @@ export default function App() {
     <main className="app-shell">
       <header className="hero">
         <div className="hero-main">
-          <div className="eyebrow">ETF 15分钟成交量监控</div>
+          <div className="eyebrow">ETF 15分钟成交额监控</div>
           <div className="title-row">
             <h1>{snapshot?.name ?? selectedSymbolInfo?.name ?? "创业板ETF易方达"}</h1>
             <span className="symbol-chip">{snapshot?.symbol ?? selectedSymbol}</span>
           </div>
           <p className="subtitle">
-            监控多只 ETF 已完成 15 分钟 K 线成交量，AkShare 不稳定时自动读取本地缓存。
+            监控多只 ETF 已完成 15 分钟 K 线成交额，AkShare 不稳定时自动读取本地缓存。
           </p>
         </div>
 
@@ -167,16 +167,16 @@ export default function App() {
               <strong>{currentAlert.ratio.toFixed(2)}x</strong>
               <p>{currentAlert.message}</p>
               <div className="alert-stats">
-                <span>当前 {formatNumber(currentAlert.volume)}</span>
-                <span>前一根 {formatNumber(currentAlert.prev_volume)}</span>
+                <span>当前 {formatMoney(currentAlert.volume)}</span>
+                <span>对比 {formatMoney(currentAlert.prev_volume)}</span>
                 <span>{currentRatioLabel} {currentAlert.ratio.toFixed(2)}x</span>
-                <span>{currentAlert.alert_type === "volume_shrink" ? "缩量" : "增量"} {formatNumber(volumeDelta ?? 0)}</span>
+                <span>{currentAlert.alert_type === "volume_shrink" ? "减少额" : "增加额"} {formatMoney(amountDelta ?? 0)}</span>
               </div>
             </div>
           ) : (
             <div className="quiet-card">
               <span>暂无异动</span>
-              <p>最近一根已完成 K 线没有触发放量阈值。</p>
+              <p>最近一根已完成 K 线没有触发成交额异动阈值。</p>
             </div>
           )}
         </aside>
@@ -218,7 +218,7 @@ function AlertTable({ alerts }: { alerts: AlertLog[] }) {
             <th>时间</th>
             <th>级别</th>
             <th>{alertRatioLabel(alerts[0])}</th>
-            <th>成交量</th>
+            <th>成交额</th>
             <th>说明</th>
           </tr>
         </thead>
@@ -237,7 +237,7 @@ function AlertTable({ alerts }: { alerts: AlertLog[] }) {
                 </span>
               </td>
               <td>{alert.ratio.toFixed(2)}x</td>
-              <td>{formatNumber(alert.volume)}</td>
+              <td>{formatMoney(alert.volume)}</td>
               <td>{alert.message}</td>
             </tr>
           ))}
@@ -248,11 +248,11 @@ function AlertTable({ alerts }: { alerts: AlertLog[] }) {
 }
 
 function alertTypeLabel(alert: AlertLog) {
-  return alert.alert_type === "volume_shrink" ? "缩量提醒" : "异动提醒";
+  return alert.alert_type === "volume_shrink" ? "缩额提醒" : "异动提醒";
 }
 
 function alertRatioLabel(alert: AlertLog) {
-  return alert.alert_type === "volume_shrink" ? "缩量比例" : "放量倍数";
+  return alert.alert_type === "volume_shrink" ? "缩额比例" : "放大倍数";
 }
 
 function formatDateTime(value: string | null | undefined) {

@@ -126,6 +126,7 @@ class AlertStore:
                 """
                 SELECT * FROM alerts
                 WHERE symbol = ?
+                AND alert_type = 'volume_spike'
                 ORDER BY candle_time DESC
                 LIMIT ?
                 """,
@@ -142,6 +143,7 @@ class AlertStore:
                 SELECT * FROM alerts
                 WHERE candle_time >= ?
                 AND candle_time <= ?
+                AND alert_type = 'volume_spike'
                 ORDER BY candle_time ASC, symbol ASC
                 """,
                 (start, end),
@@ -154,6 +156,7 @@ class AlertStore:
                 """
                 SELECT * FROM alerts
                 WHERE candle_time = ?
+                AND alert_type = 'volume_spike'
                 ORDER BY symbol ASC
                 """,
                 (candle_time.isoformat(),),
@@ -191,6 +194,66 @@ class AlertStore:
             raise RuntimeError("failed to persist notification event")
         return _parse_db_timestamp(row["created_at"]), inserted
 
+    def notification_event_exists(
+        self,
+        candle_time: datetime,
+        event_type: str,
+        symbol: str | None = None,
+    ) -> bool:
+        with self._connect() as connection:
+            if symbol is None:
+                row = connection.execute(
+                    """
+                    SELECT 1 FROM notification_events
+                    WHERE candle_time = ? AND event_type = ?
+                    LIMIT 1
+                    """,
+                    (candle_time.isoformat(), event_type),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """
+                    SELECT 1 FROM notification_events
+                    WHERE symbol = ? AND candle_time = ? AND event_type = ?
+                    LIMIT 1
+                    """,
+                    (symbol, candle_time.isoformat(), event_type),
+                ).fetchone()
+        return row is not None
+
+    def notification_event_created_at(
+        self,
+        symbol: str,
+        candle_time: datetime,
+        event_type: str,
+    ) -> datetime | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT created_at FROM notification_events
+                WHERE symbol = ? AND candle_time = ? AND event_type = ?
+                """,
+                (symbol, candle_time.isoformat(), event_type),
+            ).fetchone()
+        if row is None:
+            return None
+        return _parse_db_timestamp(row["created_at"])
+
+    def earliest_alert_created_at_for_candle_time(
+        self, candle_time: datetime
+    ) -> datetime | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT MIN(created_at) AS created_at FROM alerts
+                WHERE candle_time = ? AND alert_type = 'volume_spike'
+                """,
+                (candle_time.isoformat(),),
+            ).fetchone()
+        if row is None or row["created_at"] is None:
+            return None
+        return _parse_db_timestamp(row["created_at"])
+
     def save_candles(self, candles: list[Candle]) -> None:
         self.upsert_candles(candles)
 
@@ -205,12 +268,27 @@ class AlertStore:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(symbol, candle_time, kline_period) DO UPDATE SET
                     name = excluded.name,
-                    open = excluded.open,
-                    high = excluded.high,
-                    low = excluded.low,
-                    close = excluded.close,
-                    volume = excluded.volume,
-                    amount = excluded.amount,
+                    open = CASE
+                        WHEN excluded.amount >= candles.amount THEN excluded.open
+                        ELSE candles.open
+                    END,
+                    high = CASE
+                        WHEN excluded.amount >= candles.amount THEN excluded.high
+                        ELSE candles.high
+                    END,
+                    low = CASE
+                        WHEN excluded.amount >= candles.amount THEN excluded.low
+                        ELSE candles.low
+                    END,
+                    close = CASE
+                        WHEN excluded.amount >= candles.amount THEN excluded.close
+                        ELSE candles.close
+                    END,
+                    volume = CASE
+                        WHEN excluded.amount >= candles.amount THEN excluded.volume
+                        ELSE candles.volume
+                    END,
+                    amount = MAX(candles.amount, excluded.amount),
                     cached_at = CURRENT_TIMESTAMP
                 """,
                 [
@@ -304,12 +382,27 @@ class CandleCache:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(symbol, candle_time, kline_period) DO UPDATE SET
                     name = excluded.name,
-                    open = excluded.open,
-                    high = excluded.high,
-                    low = excluded.low,
-                    close = excluded.close,
-                    volume = excluded.volume,
-                    amount = excluded.amount,
+                    open = CASE
+                        WHEN excluded.amount >= candles.amount THEN excluded.open
+                        ELSE candles.open
+                    END,
+                    high = CASE
+                        WHEN excluded.amount >= candles.amount THEN excluded.high
+                        ELSE candles.high
+                    END,
+                    low = CASE
+                        WHEN excluded.amount >= candles.amount THEN excluded.low
+                        ELSE candles.low
+                    END,
+                    close = CASE
+                        WHEN excluded.amount >= candles.amount THEN excluded.close
+                        ELSE candles.close
+                    END,
+                    volume = CASE
+                        WHEN excluded.amount >= candles.amount THEN excluded.volume
+                        ELSE candles.volume
+                    END,
+                    amount = MAX(candles.amount, excluded.amount),
                     cached_at = CURRENT_TIMESTAMP
                 """,
                 [
@@ -366,19 +459,43 @@ def _sync_alert_volumes(connection: sqlite3.Connection, candles: list[Candle]) -
     for symbol, candle_time, kline_period in seen:
         current = connection.execute(
             """
-            SELECT volume FROM candles
+            SELECT amount FROM candles
             WHERE symbol = ? AND candle_time = ? AND kline_period = ?
             """,
             (symbol, candle_time, kline_period),
         ).fetchone()
-        previous = _previous_candle_for_alert_sync(
-            connection, symbol, candle_time, kline_period
-        )
-        if current is None or previous is None or previous["volume"] <= 0:
+        alert = connection.execute(
+            """
+            SELECT threshold FROM alerts
+            WHERE symbol = ? AND candle_time = ? AND alert_type = 'volume_spike'
+            """,
+            (symbol, candle_time),
+        ).fetchone()
+        if current is None or alert is None:
             continue
 
-        volume = current["volume"]
-        prev_volume = previous["volume"]
+        comparison = _previous_candle_for_alert_sync(
+            connection,
+            symbol,
+            candle_time,
+            kline_period,
+            current["amount"],
+            alert["threshold"],
+        )
+        if comparison is None:
+            if _has_valid_alert_sync_reference(
+                connection,
+                symbol,
+                candle_time,
+                kline_period,
+                parsed_candle_time=_parse_datetime(candle_time),
+            ):
+                _delete_volume_spike_alert(connection, symbol, candle_time)
+            continue
+
+        previous, comparison_label = comparison
+        volume = current["amount"]
+        prev_volume = previous["amount"]
         ratio = round(volume / prev_volume, 2)
         connection.execute(
             """
@@ -386,8 +503,8 @@ def _sync_alert_volumes(connection: sqlite3.Connection, candles: list[Candle]) -
             SET volume = ?,
                 prev_volume = ?,
                 ratio = ?,
-                message = symbol || ' 15分钟成交量放大 ' || printf('%.2f', ?)
-                    || ' 倍，当前量 ' || ? || '，' || ? || ' ' || ?
+                message = symbol || ' 15分钟成交额放大 ' || printf('%.2f', ?)
+                    || ' 倍，当前额 ' || ? || '，' || ? || ' ' || ?
             WHERE symbol = ? AND candle_time = ? AND alert_type = 'volume_spike'
             """,
             (
@@ -396,7 +513,7 @@ def _sync_alert_volumes(connection: sqlite3.Connection, candles: list[Candle]) -
                 ratio,
                 ratio,
                 volume,
-                _comparison_message_label(candle_time),
+                comparison_label,
                 prev_volume,
                 symbol,
                 candle_time,
@@ -405,38 +522,120 @@ def _sync_alert_volumes(connection: sqlite3.Connection, candles: list[Candle]) -
 
 
 def _previous_candle_for_alert_sync(
-    connection: sqlite3.Connection, symbol: str, candle_time: str, kline_period: str
-) -> sqlite3.Row | None:
+    connection: sqlite3.Connection,
+    symbol: str,
+    candle_time: str,
+    kline_period: str,
+    current_volume: int,
+    threshold: float,
+) -> tuple[sqlite3.Row, str] | None:
     parsed_candle_time = _parse_datetime(candle_time)
     if _uses_previous_trading_day_same_slot(parsed_candle_time):
-        return connection.execute(
-            """
-            SELECT volume FROM candles
-            WHERE symbol = ?
-            AND kline_period = ?
-            AND candle_time < ?
-            AND substr(candle_time, 12, 5) = ?
-            ORDER BY candle_time DESC
-            LIMIT 1
-            """,
-            (symbol, kline_period, candle_time, f"{parsed_candle_time:%H:%M}"),
-        ).fetchone()
-    return connection.execute(
+        previous = _previous_trading_day_same_slot_for_alert_sync(
+            connection, symbol, candle_time, kline_period, parsed_candle_time
+        )
+        if _meets_alert_sync_threshold(current_volume, previous, threshold):
+            return previous, f"前一交易日{parsed_candle_time:%H:%M}"
+        return None
+
+    same_day_previous = connection.execute(
         """
-        SELECT volume FROM candles
+        SELECT amount FROM candles
         WHERE symbol = ? AND kline_period = ? AND candle_time < ?
         ORDER BY candle_time DESC
         LIMIT 1
         """,
         (symbol, kline_period, candle_time),
     ).fetchone()
+    if _meets_alert_sync_threshold(current_volume, same_day_previous, threshold):
+        return same_day_previous, "前一根"
+
+    previous_day_same_slot = _previous_trading_day_same_slot_for_alert_sync(
+        connection, symbol, candle_time, kline_period, parsed_candle_time
+    )
+    if _meets_alert_sync_threshold(current_volume, previous_day_same_slot, threshold):
+        return previous_day_same_slot, f"前一交易日{parsed_candle_time:%H:%M}"
+    return None
 
 
-def _comparison_message_label(candle_time: str) -> str:
-    parsed_candle_time = _parse_datetime(candle_time)
+def _has_valid_alert_sync_reference(
+    connection: sqlite3.Connection,
+    symbol: str,
+    candle_time: str,
+    kline_period: str,
+    parsed_candle_time: datetime,
+) -> bool:
     if _uses_previous_trading_day_same_slot(parsed_candle_time):
-        return f"前一交易日{parsed_candle_time:%H:%M}"
-    return "前一根"
+        previous = _previous_trading_day_same_slot_for_alert_sync(
+            connection, symbol, candle_time, kline_period, parsed_candle_time
+        )
+        return _has_positive_amount(previous)
+
+    same_day_previous = connection.execute(
+        """
+        SELECT amount FROM candles
+        WHERE symbol = ? AND kline_period = ? AND candle_time < ?
+        ORDER BY candle_time DESC
+        LIMIT 1
+        """,
+        (symbol, kline_period, candle_time),
+    ).fetchone()
+    if _has_positive_amount(same_day_previous):
+        return True
+
+    previous_day_same_slot = _previous_trading_day_same_slot_for_alert_sync(
+        connection, symbol, candle_time, kline_period, parsed_candle_time
+    )
+    return _has_positive_amount(previous_day_same_slot)
+
+
+def _has_positive_amount(row: sqlite3.Row | None) -> bool:
+    return row is not None and row["amount"] > 0
+
+
+def _delete_volume_spike_alert(
+    connection: sqlite3.Connection,
+    symbol: str,
+    candle_time: str,
+) -> None:
+    connection.execute(
+        """
+        DELETE FROM alerts
+        WHERE symbol = ? AND candle_time = ? AND alert_type = 'volume_spike'
+        """,
+        (symbol, candle_time),
+    )
+
+
+def _previous_trading_day_same_slot_for_alert_sync(
+    connection: sqlite3.Connection,
+    symbol: str,
+    candle_time: str,
+    kline_period: str,
+    parsed_candle_time: datetime,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT amount FROM candles
+        WHERE symbol = ?
+        AND kline_period = ?
+        AND candle_time < ?
+        AND substr(candle_time, 12, 5) = ?
+        ORDER BY candle_time DESC
+        LIMIT 1
+        """,
+        (symbol, kline_period, candle_time, f"{parsed_candle_time:%H:%M}"),
+    ).fetchone()
+
+
+def _meets_alert_sync_threshold(
+    current_volume: int,
+    previous: sqlite3.Row | None,
+    threshold: float,
+) -> bool:
+    if previous is None or previous["amount"] <= 0:
+        return False
+    return current_volume / previous["amount"] >= threshold
 
 
 def _uses_previous_trading_day_same_slot(candle_time: datetime) -> bool:

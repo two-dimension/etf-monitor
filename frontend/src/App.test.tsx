@@ -222,9 +222,9 @@ describe("ETF monitor dashboard", () => {
 
     render(<App />);
 
-    expect(await screen.findByText("缩量提醒")).toBeInTheDocument();
+    expect(await screen.findByText("缩额提醒")).toBeInTheDocument();
     expect(screen.getAllByText("0.28x")).toHaveLength(2);
-    expect(screen.getByText("缩量比例")).toBeInTheDocument();
+    expect(screen.getByText("缩额比例")).toBeInTheDocument();
   });
 
   test("switches monitored ETF and loads the selected symbol", async () => {

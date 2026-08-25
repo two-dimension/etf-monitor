@@ -22,7 +22,27 @@ def alert(candle_time: str, alert_type: str) -> AlertCreate:
 
 def test_list_alerts_returns_only_volume_spike_alerts_by_default(tmp_path):
     store = AlertStore(tmp_path / "alerts.db")
-    store.save_alert(alert("2026-07-21T10:00:00", "volume_shrink"))
+    with store._connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO alerts (
+                symbol, name, alert_type, candle_time, volume, prev_volume, ratio,
+                threshold, severity, message
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "510310.SH",
+                "沪深300ETF易方达",
+                "volume_shrink",
+                "2026-07-21T10:00:00",
+                1000,
+                400,
+                0.4,
+                0.5,
+                "warning",
+                "legacy shrink alert",
+            ),
+        )
     store.save_alert(alert("2026-07-21T10:15:00", "volume_spike"))
 
     alerts = store.list_alerts("510310.SH", limit=10)

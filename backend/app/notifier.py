@@ -288,7 +288,7 @@ def _no_anomaly_body(candle: Candle, notified_at: datetime, timezone_name: str) 
             f"标的: {candle.name} ({candle.symbol})",
             "状态: 无异动",
             f"K线时间: {candle.time:%Y-%m-%d %H:%M:%S}",
-            f"成交量(手): {_format_volume(candle.volume)}",
+            f"成交额: {_format_amount(candle.amount)}",
             f"收盘价: {candle.close}",
             "",
             "说明: 本次K线更新未检测到异动。",
@@ -307,7 +307,7 @@ def _no_anomalies_body(
                 "",
                 f"标的: {candle.name} ({candle.symbol})",
                 f"K线时间: {candle.time:%Y-%m-%d %H:%M:%S}",
-                f"成交量(手): {_format_volume(candle.volume)}",
+                f"成交额: {_format_amount(candle.amount)}",
                 f"收盘价: {candle.close}",
             ]
         )
@@ -369,21 +369,21 @@ def _format_record_time(value, timezone_name: str) -> str:
 
 
 def _alert_type_label(_alert_type: str) -> str:
-    return "放量"
+    return "成交额"
 
 
 def _plain_alert_table(alert: AlertLog, settings: Settings) -> list[str]:
-    header = f"时间\t标的代码\t标的名称\t成交量(手)\t{_change_column_label(alert)}"
+    header = f"时间\t标的代码\t标的名称\t成交额\t{_change_column_label(alert)}"
     previous_time = _comparison_time(alert, settings)
     return [
         header,
         (
             f"{_short_datetime(previous_time)}\t{_display_symbol(alert.symbol)}\t"
-            f"{alert.name}\t{_format_volume(alert.prev_volume)}\t——"
+            f"{alert.name}\t{_format_amount(alert.prev_volume)}\t——"
         ),
         (
             f"{_short_datetime(alert.candle_time)}\t{_display_symbol(alert.symbol)}\t"
-            f"{alert.name}\t{_format_volume(alert.volume)}\t"
+            f"{alert.name}\t{_format_amount(alert.volume)}\t"
             f"{_percentage_change(alert)}"
         ),
     ]
@@ -509,21 +509,21 @@ def _daily_summary_html_body(
 
 
 def _render_alert_table_image(alert: AlertLog, settings: Settings) -> bytes:
-    headers = ["时间", "标的代码", "标的名称", "成交量(手)", _change_column_label(alert)]
+    headers = ["时间", "标的代码", "标的名称", "成交额", _change_column_label(alert)]
     previous_time = _comparison_time(alert, settings)
     rows = [
         [
             _short_datetime(previous_time),
             _display_symbol(alert.symbol),
             alert.name,
-            _format_volume(alert.prev_volume),
+            _format_amount(alert.prev_volume),
             "——",
         ],
         [
             _short_datetime(alert.candle_time),
             _display_symbol(alert.symbol),
             alert.name,
-            _format_volume(alert.volume),
+            _format_amount(alert.volume),
             _percentage_change(alert),
         ],
     ]
@@ -617,7 +617,7 @@ def _font(size: int, bold: bool = False) -> ImageFont.ImageFont:
 
 def _alerts_table(alerts: Sequence[AlertLog]) -> list[str]:
     lines = [
-        "| K线时间 | 标的 | 类型 | 级别 | 成交量(手) | 对比口径 | 对比成交量(手) | 放量倍数 | 阈值 |",
+        "| K线时间 | 标的 | 类型 | 级别 | 成交额 | 对比口径 | 对比成交额 | 放大倍数 | 阈值 |",
     ]
     for alert in sorted(alerts, key=lambda item: (item.candle_time, item.symbol)):
         lines.append(
@@ -626,9 +626,9 @@ def _alerts_table(alerts: Sequence[AlertLog]) -> list[str]:
             f"{alert.name} ({alert.symbol}) | "
             f"{_alert_type_label(alert.alert_type)}异动 | "
             f"{alert.severity} | "
-            f"{_format_volume(alert.volume)} | "
+            f"{_format_amount(alert.volume)} | "
             f"{_comparison_label(alert)} | "
-            f"{_format_volume(alert.prev_volume)} | "
+            f"{_format_amount(alert.prev_volume)} | "
             f"{alert.ratio:.2f} 倍 | "
             f"{alert.threshold} |"
         )
@@ -654,6 +654,14 @@ def _format_volume(volume: int) -> str:
     return f"{lots:,.2f}".rstrip("0").rstrip(".")
 
 
+def _format_amount(amount: float) -> str:
+    if amount >= 100_000_000:
+        return f"{amount / 100_000_000:.2f}亿元"
+    if amount >= 10_000:
+        return f"{amount / 10_000:.2f}万元"
+    return f"{amount:,.2f}元".rstrip("0").rstrip(".")
+
+
 def _alert_time_text(first_time: datetime, latest_time: datetime) -> str:
     if first_time == latest_time:
         return f"{first_time:%Y-%m-%d %H:%M}"
@@ -672,7 +680,7 @@ def _comparison_label(alert: AlertLog) -> str:
 
 def _change_column_label(alert: AlertLog) -> str:
     if _uses_previous_trading_day_same_slot(alert):
-        return "日环比"
+        return "日同比"
     return "日内环比"
 
 
@@ -722,7 +730,7 @@ def _comparison_time_from_db(alert: AlertLog, settings: Settings) -> datetime | 
 
 
 def _uses_previous_trading_day_same_slot(alert: AlertLog) -> bool:
-    if "前一交易日同一时间点" in alert.message:
+    if "前一交易日" in alert.message:
         return True
     return (alert.candle_time.hour, alert.candle_time.minute) in {
         (9, 45),

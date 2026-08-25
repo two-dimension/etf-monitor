@@ -3,7 +3,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { normalizeSpawnCommand } from "./devProcess.mjs";
+import { normalizeSpawnCommand, resolveDevPorts } from "./devProcess.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const isWindows = process.platform === "win32";
@@ -15,6 +15,9 @@ const sharedEnv = {
   npm_config_cache: path.join(root, ".npm-cache"),
   FORCE_COLOR: "1",
 };
+const { backendPort, frontendPort } = resolveDevPorts(sharedEnv);
+sharedEnv.BACKEND_PORT = backendPort;
+sharedEnv.FRONTEND_PORT = frontendPort;
 
 const children = [
   run("backend", pythonCommand, [
@@ -27,14 +30,14 @@ const children = [
     "--host",
     "127.0.0.1",
     "--port",
-    "8001",
+    backendPort,
   ]),
   run("frontend", npmCommand, ["run", "dev", "--prefix", "frontend"]),
 ];
 
 console.log("ETF monitor is starting in one terminal.");
-console.log("Frontend: http://127.0.0.1:5173");
-console.log("Backend:  http://127.0.0.1:8001/docs");
+console.log(`Frontend: http://127.0.0.1:${frontendPort}`);
+console.log(`Backend:  http://127.0.0.1:${backendPort}/docs`);
 console.log("Press Ctrl+C to stop both services.");
 
 let shuttingDown = false;

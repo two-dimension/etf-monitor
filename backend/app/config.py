@@ -10,9 +10,11 @@ from pydantic import BaseModel, Field
 DEFAULT_SYMBOLS = (
     "588000.SH:科创50ETF华夏,"
     "159915.SZ:创业板ETF易方达,"
-    "510300.SH:沪深300ETF华泰柏瑞"
+    "510300.SH:沪深300ETF华泰柏瑞,"
+    "513310.SH:中韩半导体ETF华泰柏瑞"
 )
 _DEFAULT_LATE_SESSION_START = time(14, 30)
+DEFAULT_SYMBOL_FIRST_CANDLE_TIMES = "513310.SH:10:45"
 _ENV_LOADED = False
 
 
@@ -83,6 +85,16 @@ def _time_env(name: str, default: time) -> time:
         return default
 
 
+def _time_value(value: str, default: time) -> time:
+    parts = value.split(":")
+    if len(parts) != 2:
+        return default
+    try:
+        return time(int(parts[0]), int(parts[1]))
+    except ValueError:
+        return default
+
+
 def _bool_env(name: str, default: bool) -> bool:
     _ensure_env_loaded()
     value = os.getenv(name)
@@ -116,6 +128,22 @@ def _symbols_env() -> list[EtfSymbolConfig]:
     return symbols
 
 
+def _symbol_first_candle_times_env() -> dict[str, time]:
+    raw_value = _str_env(
+        "SYMBOL_FIRST_CANDLE_TIMES", DEFAULT_SYMBOL_FIRST_CANDLE_TIMES
+    )
+    values: dict[str, time] = {}
+    for raw_item in raw_value.split(","):
+        item = raw_item.strip()
+        if not item or ":" not in item:
+            continue
+        raw_symbol, raw_time = item.split(":", 1)
+        symbol = raw_symbol.strip().upper()
+        if symbol:
+            values[symbol] = _time_value(raw_time.strip(), time(9, 45))
+    return values
+
+
 class Settings(BaseModel):
     symbol: str = Field(default_factory=lambda: _str_env("ETF_SYMBOL", "159915.SZ"))
     symbol_name: str = Field(default_factory=lambda: _str_env("ETF_NAME", "创业板ETF易方达"))
@@ -129,9 +157,12 @@ class Settings(BaseModel):
             "LATE_SESSION_START_TIME", _DEFAULT_LATE_SESSION_START
         )
     )
+    symbol_first_candle_times: dict[str, time] = Field(
+        default_factory=_symbol_first_candle_times_env
+    )
     opening_volume_ratio_threshold: float = Field(
         default_factory=lambda: _float_env(
-            "OPENING_VOLUME_RATIO_THRESHOLD", 1.5
+            "OPENING_VOLUME_RATIO_THRESHOLD", 1.15
         )
     )
     opening_critical_ratio_threshold: float = Field(
@@ -146,12 +177,21 @@ class Settings(BaseModel):
     poll_interval_seconds: int = Field(
         default_factory=lambda: _int_env("POLL_INTERVAL_SECONDS", 60)
     )
+    candle_completion_delay_seconds: int = Field(
+        default_factory=lambda: _int_env("CANDLE_COMPLETION_DELAY_SECONDS", 60)
+    )
+    no_anomaly_confirmation_delay_seconds: int = Field(
+        default_factory=lambda: _int_env("NO_ANOMALY_CONFIRMATION_DELAY_SECONDS", 90)
+    )
+    batch_notification_max_lag_seconds: int = Field(
+        default_factory=lambda: _int_env("BATCH_NOTIFICATION_MAX_LAG_SECONDS", 900)
+    )
     volume_ratio_threshold: float = Field(
-        default_factory=lambda: _float_env("VOLUME_RATIO_THRESHOLD", 1.5)
+        default_factory=lambda: _float_env("VOLUME_RATIO_THRESHOLD", 1.3)
     )
     late_session_volume_ratio_threshold: float = Field(
         default_factory=lambda: _float_env(
-            "LATE_SESSION_VOLUME_RATIO_THRESHOLD", 1.5
+            "LATE_SESSION_VOLUME_RATIO_THRESHOLD", 1.3
         )
     )
     volume_shrink_ratio_threshold: float = Field(
@@ -175,7 +215,7 @@ class Settings(BaseModel):
         default_factory=lambda: _bool_env("SCHEDULER_ENABLED", True)
     )
     cors_origin: str = Field(
-        default_factory=lambda: _str_env("CORS_ORIGIN", "http://localhost:5173")
+        default_factory=lambda: _str_env("CORS_ORIGIN", "http://localhost:5174")
     )
     email_enabled: bool = Field(
         default_factory=lambda: _bool_env("EMAIL_ENABLED", False)
@@ -222,7 +262,7 @@ class Settings(BaseModel):
         return self.kline_period
 
     def volume_ratio_threshold_for(self, candle_time) -> float:
-        if self.is_opening_candle(candle_time):
+        if self.is_morning_opening_candle(candle_time):
             return self.opening_volume_ratio_threshold
         if self.is_late_session(candle_time):
             return self.late_session_volume_ratio_threshold
@@ -240,3 +280,16 @@ class Settings(BaseModel):
         if hasattr(candle_time, "time"):
             candle_time = candle_time.time()
         return candle_time in {time(9, 45), time(13, 15)}
+
+    def is_morning_opening_candle(self, candle_time) -> bool:
+        if hasattr(candle_time, "time"):
+            candle_time = candle_time.time()
+        return candle_time == time(9, 45)
+
+    def first_completed_candle_time_for(self, symbol: str) -> time:
+        return self.symbol_first_candle_times.get(symbol.upper(), time(9, 45))
+
+    def should_wait_for_symbol_at(self, symbol: str, candle_time) -> bool:
+        if hasattr(candle_time, "time"):
+            candle_time = candle_time.time()
+        return candle_time >= self.first_completed_candle_time_for(symbol)

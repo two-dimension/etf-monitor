@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Sequence
 from zoneinfo import ZoneInfo
 
-from app.config import Settings
+from app.config import EtfSymbolConfig, Settings
 from app.detector import detect_volume_spike
 from app.market_data import MarketDataClient
 from app.models import (
@@ -24,6 +25,7 @@ from app.store import AlertStore
 
 logger = logging.getLogger(__name__)
 ALERT_BATCH_SYMBOL = "__alert_batch__"
+ALERT_AFTER_NO_ANOMALY_EVENT_TYPE = "alert_after_no_anomaly"
 DAILY_SUMMARY_SYMBOL = "__all__"
 DAILY_SUMMARY_TIME = time(15, 0)
 FIRST_COMPLETED_CANDLE_TIME = time(9, 45)
@@ -63,12 +65,27 @@ class MonitorService:
         return response
 
     def poll_all(self) -> list[PollResponse]:
+        monitored_symbols = self.settings.monitored_symbols()
+        latest_candles_by_symbol: dict[str, list[Candle]] = {}
+        errors_by_symbol: dict[str, Exception] = {}
+        with ThreadPoolExecutor(max_workers=max(1, len(monitored_symbols))) as executor:
+            futures = {
+                item.symbol: executor.submit(self._fetch_live_candles, item.symbol)
+                for item in monitored_symbols
+            }
+            for symbol, future in futures.items():
+                try:
+                    latest_candles_by_symbol[symbol] = future.result()
+                except Exception as exc:
+                    errors_by_symbol[symbol] = exc
+
         results: list[PollResponse] = []
         latest_candles: list[Candle] = []
-
-        for item in self.settings.monitored_symbols():
-            response, detection = self._poll_symbol(
+        for item in monitored_symbols:
+            response, detection = self._process_polled_symbol(
                 item.symbol,
+                latest_candles_by_symbol.get(item.symbol),
+                errors_by_symbol.get(item.symbol),
                 notify_no_anomaly=False,
                 send_notifications=False,
             )
@@ -91,6 +108,7 @@ class MonitorService:
             data_status: DataStatus = "live" if candles else "empty"
         except Exception as exc:
             candles = self.candle_cache.list_candles(requested_symbol)
+            candles = _completed_candles(candles, self.settings)
             candles = _snapshot_candles(candles, self.settings)
             self.last_error = str(exc)
             data_status = "cached" if candles else "degraded"
@@ -128,7 +146,7 @@ class MonitorService:
 
     def _fetch_live_candles(self, symbol: str) -> list[Candle]:
         candles = self.market_data_client.fetch_intraday_candles(symbol)
-        return _completed_candles(candles)
+        return _completed_candles(candles, self.settings)
 
     def _poll_symbol(
         self,
@@ -138,12 +156,40 @@ class MonitorService:
     ) -> tuple[PollResponse, DetectionResult]:
         try:
             candles = self._fetch_live_candles(requested_symbol)
+            return self._process_polled_symbol(
+                requested_symbol,
+                candles,
+                None,
+                notify_no_anomaly=notify_no_anomaly,
+                send_notifications=send_notifications,
+            )
+        except Exception as exc:
+            return self._process_polled_symbol(
+                requested_symbol,
+                None,
+                exc,
+                notify_no_anomaly=notify_no_anomaly,
+                send_notifications=send_notifications,
+            )
+
+    def _process_polled_symbol(
+        self,
+        requested_symbol: str,
+        candles: list[Candle] | None,
+        error: Exception | None,
+        notify_no_anomaly: bool,
+        send_notifications: bool,
+    ) -> tuple[PollResponse, DetectionResult]:
+        if error is None:
+            candles = candles or []
             self.candle_cache.upsert_candles(candles)
-            latest_day_candles = _latest_trading_day_candles(candles)
+            detection_candles = self.candle_cache.list_candles(requested_symbol, limit=500)
+            detection_candles = _completed_candles(detection_candles, self.settings)
+            latest_day_candles = _latest_trading_day_candles(detection_candles)
             self.last_error = None
             self.last_status = "live" if latest_day_candles else "empty"
             detection = self._detect_and_save(
-                candles,
+                detection_candles,
                 notify_no_anomaly=notify_no_anomaly,
                 send_notifications=send_notifications,
             )
@@ -156,29 +202,31 @@ class MonitorService:
                 ),
                 detection,
             )
-        except Exception as exc:
-            cached = self.candle_cache.list_candles(requested_symbol, limit=500)
-            latest_day_cached = _latest_trading_day_candles(cached)
-            self.last_error = str(exc)
-            self.last_status = "cached" if latest_day_cached else "degraded"
-            detection = (
-                self._detect_and_save(
-                    cached,
-                    send_notifications=send_notifications,
-                )
-                if latest_day_cached
-                else DetectionResult(None, [], None)
+
+        exc = error
+        cached = self.candle_cache.list_candles(requested_symbol, limit=500)
+        cached = _completed_candles(cached, self.settings)
+        latest_day_cached = _latest_trading_day_candles(cached)
+        self.last_error = str(exc)
+        self.last_status = "cached" if latest_day_cached else "degraded"
+        detection = (
+            self._detect_and_save(
+                cached,
+                send_notifications=send_notifications,
             )
-            return (
-                PollResponse(
-                    symbol=requested_symbol,
-                    data_status=self.last_status,
-                    candle_count=len(latest_day_cached),
-                    alert=detection.latest_inserted_alert,
-                    error=str(exc),
-                ),
-                detection,
-            )
+            if latest_day_cached
+            else DetectionResult(None, [], None)
+        )
+        return (
+            PollResponse(
+                symbol=requested_symbol,
+                data_status=self.last_status,
+                candle_count=len(latest_day_cached),
+                alert=detection.latest_inserted_alert,
+                error=str(exc),
+            ),
+            detection,
+        )
 
     def _detect_and_save(
         self,
@@ -228,9 +276,22 @@ class MonitorService:
             and not latest_candle_has_alert
             and not inserted_alerts
             and send_notifications
+            and self._ready_for_no_anomaly_notification(latest_candle)
         ):
             self._send_no_anomaly_notification(latest_candle)
         return DetectionResult(latest_inserted_alert, inserted_alerts, latest_candle)
+
+    def _ready_for_no_anomaly_notification(self, candle: Candle) -> bool:
+        now = datetime.now(ZoneInfo(self.settings.timezone))
+        if now.tzinfo is not None:
+            now = now.replace(tzinfo=None)
+        candle_time = candle.time
+        if candle_time.tzinfo is not None:
+            candle_time = candle_time.astimezone(ZoneInfo(self.settings.timezone)).replace(
+                tzinfo=None
+            )
+        delay = timedelta(seconds=self.settings.no_anomaly_confirmation_delay_seconds)
+        return candle_time + delay <= now
 
     def _send_alert_notification(self, alert: AlertLog) -> None:
         try:
@@ -283,29 +344,102 @@ class MonitorService:
         results: Sequence[PollResponse],
         latest_candles: Sequence[Candle],
     ) -> None:
-        monitored_count = len(self.settings.monitored_symbols())
-        if len(results) < monitored_count or len(latest_candles) < monitored_count:
-            return
-        if any(response.error is not None for response in results):
+        monitored_symbols = self.settings.monitored_symbols()
+        if len(results) < len(monitored_symbols) or not latest_candles:
             return
 
         latest_time = max(candle.time for candle in latest_candles)
-        if any(candle.time != latest_time for candle in latest_candles):
+        if any(
+            response.error is not None
+            and self.settings.should_wait_for_symbol_at(response.symbol, latest_time)
+            for response in results
+        ):
             return
-
-        _, inserted = self.alert_store.save_notification_event_with_status(
-            symbol=ALERT_BATCH_SYMBOL,
-            candle_time=latest_time,
-            event_type="alert_batch",
-        )
-        if not inserted:
+        ready_candles = self._ready_batch_candles(monitored_symbols, latest_candles)
+        if ready_candles is None:
             return
 
         alerts = self.alert_store.list_alerts_for_candle_time(latest_time)
         if alerts:
+            if not self._fresh_enough_for_batch_notification(latest_time):
+                return
+            if not self._claim_alert_batch_notification(latest_time):
+                return
             self._send_alert_notifications(alerts)
-        else:
-            self._send_no_anomaly_notifications(latest_candles)
+            return
+        if not all(
+            self._ready_for_no_anomaly_notification(candle)
+            for candle in ready_candles
+        ):
+            return
+        self._send_no_anomaly_notifications(ready_candles)
+
+    def _claim_alert_batch_notification(self, candle_time: datetime) -> bool:
+        _, inserted = self.alert_store.save_notification_event_with_status(
+            symbol=ALERT_BATCH_SYMBOL,
+            candle_time=candle_time,
+            event_type="alert_batch",
+        )
+        if inserted:
+            return True
+
+        if not self.alert_store.notification_event_exists(
+            candle_time,
+            event_type="no_anomaly",
+        ):
+            return False
+
+        alert_batch_created_at = self.alert_store.notification_event_created_at(
+            ALERT_BATCH_SYMBOL,
+            candle_time,
+            event_type="alert_batch",
+        )
+        earliest_alert_created_at = (
+            self.alert_store.earliest_alert_created_at_for_candle_time(candle_time)
+        )
+        if (
+            alert_batch_created_at is None
+            or earliest_alert_created_at is None
+            or alert_batch_created_at >= earliest_alert_created_at
+        ):
+            return False
+
+        _, inserted_after_no_anomaly = (
+            self.alert_store.save_notification_event_with_status(
+                symbol=ALERT_BATCH_SYMBOL,
+                candle_time=candle_time,
+                event_type=ALERT_AFTER_NO_ANOMALY_EVENT_TYPE,
+            )
+        )
+        return inserted_after_no_anomaly
+
+    def _ready_batch_candles(
+        self,
+        monitored_symbols: Sequence[EtfSymbolConfig],
+        latest_candles: Sequence[Candle],
+    ) -> list[Candle] | None:
+        latest_time = max(candle.time for candle in latest_candles)
+        latest_by_symbol = {candle.symbol.upper(): candle for candle in latest_candles}
+        ready_candles: list[Candle] = []
+        for item in monitored_symbols:
+            candle = latest_by_symbol.get(item.symbol.upper())
+            if candle is None or candle.time != latest_time:
+                if self.settings.should_wait_for_symbol_at(item.symbol, latest_time):
+                    return None
+                continue
+            ready_candles.append(candle)
+        return ready_candles or None
+
+    def _fresh_enough_for_batch_notification(self, candle_time: datetime) -> bool:
+        now = datetime.now(ZoneInfo(self.settings.timezone))
+        if now.tzinfo is not None:
+            now = now.replace(tzinfo=None)
+        if candle_time.tzinfo is not None:
+            candle_time = candle_time.astimezone(ZoneInfo(self.settings.timezone)).replace(
+                tzinfo=None
+            )
+        max_lag = timedelta(seconds=self.settings.batch_notification_max_lag_seconds)
+        return candle_time <= now and now - candle_time <= max_lag
 
     def _send_daily_summary_if_market_closed(
         self, latest_candles: Sequence[Candle]
@@ -350,13 +484,21 @@ class MonitorService:
         return alert if alert.candle_time == latest_candle.time else None
 
 
-def _completed_candles(candles: list[Candle]) -> list[Candle]:
-    now = datetime.now()
+def _completed_candles(candles: list[Candle], settings: Settings) -> list[Candle]:
+    now = datetime.now(ZoneInfo(settings.timezone))
+    if now.tzinfo is not None:
+        now = now.replace(tzinfo=None)
+    completion_delay = timedelta(seconds=settings.candle_completion_delay_seconds)
     completed: list[Candle] = []
     for candle in sorted(candles, key=lambda item: item.time):
-        if candle.time <= now:
+        candle_time = candle.time
+        if candle_time.tzinfo is not None:
+            candle_time = candle_time.astimezone(ZoneInfo(settings.timezone)).replace(
+                tzinfo=None
+            )
+        if candle_time + completion_delay <= now:
             completed.append(candle)
-    return completed or sorted(candles, key=lambda item: item.time)
+    return completed
 
 
 def _latest_trading_day_candles(candles: Sequence[Candle]) -> list[Candle]:

@@ -9,3 +9,10 @@ export function normalizeSpawnCommand(command, args, options = {}) {
     args: ["/d", "/s", "/c", command, ...args],
   };
 }
+
+export function resolveDevPorts(env = process.env) {
+  return {
+    backendPort: env.BACKEND_PORT || "8000",
+    frontendPort: env.FRONTEND_PORT || "5174",
+  };
+}

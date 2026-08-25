@@ -85,6 +85,23 @@ def late_session_same_slot_fallback_alert_log() -> AlertLog:
     )
 
 
+def regular_same_slot_fallback_alert_log() -> AlertLog:
+    return alert_log().model_copy(
+        update={
+            "id": 3670,
+            "symbol": "159915.SZ",
+            "name": "创业板ETF易方达",
+            "candle_time": datetime.fromisoformat("2026-07-29T10:30:00"),
+            "volume": 292148700,
+            "prev_volume": 204751200,
+            "ratio": 1.43,
+            "threshold": 1.3,
+            "created_at": datetime(2026, 7, 29, 2, 44, 34, tzinfo=UTC),
+            "message": "159915.SZ 15分钟成交量放大 1.43 倍，当前量 292148700，前一交易日10:30 204751200",
+        }
+    )
+
+
 def normal_candle() -> Candle:
     return Candle(
         symbol="159915.SZ",
@@ -166,8 +183,57 @@ def test_late_session_same_slot_fallback_table_uses_previous_trading_day_time(tm
 
     table = _plain_alert_table(late_session_same_slot_fallback_alert_log(), settings)
 
-    assert "7/27/26 14:40\t510300\t沪深300ETF华泰柏瑞\t251,887.34" in table[1]
+    assert "7/27/26 14:40\t510300\t沪深300ETF华泰柏瑞\t2518.87万元" in table[1]
     assert "7/28/26 14:35" not in table[1]
+
+
+def test_regular_same_slot_fallback_table_uses_previous_trading_day_time(tmp_path):
+    alert = regular_same_slot_fallback_alert_log()
+    settings = Settings(db_path=tmp_path / "alerts.db")
+    store = AlertStore(settings.db_path)
+    store.save_candles(
+        [
+            Candle(
+                symbol=alert.symbol,
+                name=alert.name,
+                time=datetime.fromisoformat("2026-07-28T10:30:00"),
+                open=1.0,
+                high=1.1,
+                low=0.9,
+                close=1.0,
+                volume=alert.prev_volume,
+                amount=float(alert.prev_volume),
+            ),
+            Candle(
+                symbol=alert.symbol,
+                name=alert.name,
+                time=datetime.fromisoformat("2026-07-29T10:15:00"),
+                open=1.0,
+                high=1.1,
+                low=0.9,
+                close=1.0,
+                volume=197485700,
+                amount=197485700.0,
+            ),
+            Candle(
+                symbol=alert.symbol,
+                name=alert.name,
+                time=alert.candle_time,
+                open=1.0,
+                high=1.1,
+                low=0.9,
+                close=1.0,
+                volume=alert.volume,
+                amount=float(alert.volume),
+            ),
+        ]
+    )
+
+    table = _plain_alert_table(alert, settings)
+
+    assert table[0].endswith("\t日同比")
+    assert "7/28/26 10:30\t159915\t创业板ETF易方达\t2.05亿元" in table[1]
+    assert "7/29/26 10:15" not in table[1]
 
 
 def test_smtp_notifier_sends_alert_email_to_configured_recipients(
@@ -207,9 +273,9 @@ def test_smtp_notifier_sends_alert_email_to_configured_recipients(
     assert "ETF Monitor 告警通知" in content
     assert "交易日：2026-07-27" in content
     assert "监控标的：沪深300ETF易方达 (510310.SH)" in content
-    assert "时间\t标的代码\t标的名称\t成交量(手)\t日环比" in content
-    assert "7/24/26 09:45\t510310\t沪深300ETF易方达\t201,509\t——" in content
-    assert "7/27/26 09:45\t510310\t沪深300ETF易方达\t406,676.94\t102%" in content
+    assert "时间\t标的代码\t标的名称\t成交额\t日同比" in content
+    assert "7/24/26 09:45\t510310\t沪深300ETF易方达\t2015.09万元\t——" in content
+    assert "7/27/26 09:45\t510310\t沪深300ETF易方达\t4066.77万元\t102%" in content
     assert "告警触发时间：2026-07-27 09:45" in content
     assert "记录时间：2026-07-27 09:45:30 (Asia/Shanghai)" in content
     assert "| K线时间 |" not in content
@@ -247,9 +313,9 @@ def test_smtp_notifier_formats_late_session_volume_like_eastmoney_lots(
     content = FakeSMTP.instances[0].sent_messages[0].get_body(
         preferencelist=("plain",)
     ).get_content()
-    assert "时间\t标的代码\t标的名称\t成交量(手)\t日内环比" in content
-    assert "7/28/26 14:30\t159915\t创业板ETF易方达\t427,897\t——" in content
-    assert "7/28/26 14:35\t159915\t创业板ETF易方达\t936,678\t119%" in content
+    assert "时间\t标的代码\t标的名称\t成交额\t日内环比" in content
+    assert "7/28/26 14:30\t159915\t创业板ETF易方达\t4278.97万元\t——" in content
+    assert "7/28/26 14:35\t159915\t创业板ETF易方达\t9366.78万元\t119%" in content
 
 
 def test_smtp_notifier_sends_alert_batch_in_one_email(monkeypatch, tmp_path):
@@ -283,11 +349,11 @@ def test_smtp_notifier_sends_alert_batch_in_one_email(monkeypatch, tmp_path):
     assert (
         "监控标的：创业板ETF易方达 (159915.SZ)、沪深300ETF易方达 (510310.SH)"
     ) in content
-    assert "时间\t标的代码\t标的名称\t成交量(手)\t日内环比" in content
-    assert "7/20/26 13:15\t159915\t创业板ETF易方达\t10\t——" in content
-    assert "7/20/26 13:30\t159915\t创业板ETF易方达\t36\t260%" in content
-    assert "7/20/26 13:30\t510310\t沪深300ETF易方达\t10\t——" in content
-    assert "7/20/26 13:45\t510310\t沪深300ETF易方达\t36\t260%" in content
+    assert "时间\t标的代码\t标的名称\t成交额\t日内环比" in content
+    assert "7/20/26 13:15\t159915\t创业板ETF易方达\t1,000.00元\t——" in content
+    assert "7/20/26 13:30\t159915\t创业板ETF易方达\t3,600.00元\t260%" in content
+    assert "7/20/26 13:30\t510310\t沪深300ETF易方达\t1,000.00元\t——" in content
+    assert "7/20/26 13:45\t510310\t沪深300ETF易方达\t3,600.00元\t260%" in content
     image_parts = [part for part in message.walk() if part.get_content_type() == "image/png"]
     assert len(image_parts) == 2
     assert all(
@@ -402,9 +468,9 @@ def test_smtp_notifier_sends_daily_summary_alerts_as_inline_excel_images(
     assert "ETF Monitor 收盘总结" in content
     assert "交易日：2026-07-27" in content
     assert "今日异动：" in content
-    assert "时间\t标的代码\t标的名称\t成交量(手)\t日环比" in content
-    assert "7/24/26 09:45\t510310\t沪深300ETF易方达\t201,509\t——" in content
-    assert "7/27/26 09:45\t510310\t沪深300ETF易方达\t406,676.94\t102%" in content
+    assert "时间\t标的代码\t标的名称\t成交额\t日同比" in content
+    assert "7/24/26 09:45\t510310\t沪深300ETF易方达\t2015.09万元\t——" in content
+    assert "7/27/26 09:45\t510310\t沪深300ETF易方达\t4066.77万元\t102%" in content
     image_parts = [part for part in message.walk() if part.get_content_type() == "image/png"]
     assert len(image_parts) == 1
     assert image_parts[0].get("Content-Disposition", "").startswith("inline")

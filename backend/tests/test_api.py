@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, time
 
 from fastapi.testclient import TestClient
 
@@ -6,6 +6,7 @@ from app import service as service_module
 from app.config import EtfSymbolConfig, Settings
 from app.main import create_app
 from app.models import Candle
+from app.store import AlertStore
 
 
 def candle(
@@ -81,6 +82,17 @@ class StatefulMarketDataClient:
         self.calls_by_symbol[symbol] = call_count + 1
         snapshots = self.snapshots_by_symbol[symbol]
         return snapshots[min(call_count, len(snapshots) - 1)]
+
+
+class SymbolErrorMarketDataClient:
+    def __init__(self, candles_by_symbol=None, error_symbols=None):
+        self.candles_by_symbol = candles_by_symbol or {}
+        self.error_symbols = set(error_symbols or [])
+
+    def fetch_intraday_candles(self, symbol: str):
+        if symbol in self.error_symbols:
+            raise RuntimeError("market data unavailable")
+        return self.candles_by_symbol[symbol]
 
 
 class RecordingNotifier:
@@ -257,7 +269,7 @@ def test_poll_all_sends_new_alerts_in_one_batch_and_excludes_normal_symbols(tmp_
     assert notifier.no_anomaly_batches == []
 
 
-def test_poll_all_waits_until_all_symbols_reach_same_candle_before_alert_email(tmp_path):
+def test_poll_all_sends_same_round_alerts_in_one_email(tmp_path):
     settings = Settings(
         symbols=[
             EtfSymbolConfig(symbol="588000.SH", name="绉戝垱50ETF鍗庡"),
@@ -270,7 +282,7 @@ def test_poll_all_waits_until_all_symbols_reach_same_candle_before_alert_email(t
         return [candle("2026-07-20T09:45:00", 100, symbol=symbol, name=name)]
 
     def new_quote(symbol: str, name: str, volume: int) -> list:
-        return [
+        return prior_quote(symbol, name) + [
             candle("2026-07-21T09:30:00", 100, symbol=symbol, name=name),
             candle("2026-07-21T09:45:00", volume, symbol=symbol, name=name),
         ]
@@ -362,6 +374,375 @@ def test_poll_all_sends_normal_symbols_in_one_no_anomaly_batch(tmp_path):
         item.time == datetime.fromisoformat("2026-07-21T10:00:00") for item in candles
     )
     assert notified_at.tzinfo is not None
+
+
+def test_poll_all_sends_late_alert_after_legacy_no_anomaly_batch(tmp_path):
+    settings = Settings(
+        symbols=[
+            EtfSymbolConfig(symbol="159915.SZ", name="ETF A"),
+            EtfSymbolConfig(symbol="510310.SH", name="ETF B"),
+        ]
+    )
+    alert_time = datetime.fromisoformat("2026-07-21T10:30:00")
+    market_data = StatefulMarketDataClient(
+        {
+            "159915.SZ": [
+                [
+                    candle("2026-07-21T10:15:00", 1000, "159915.SZ", "ETF A"),
+                    candle("2026-07-21T10:30:00", 1100, "159915.SZ", "ETF A"),
+                ],
+                [
+                    candle("2026-07-21T10:15:00", 1000, "159915.SZ", "ETF A"),
+                    candle("2026-07-21T10:30:00", 1500, "159915.SZ", "ETF A"),
+                ],
+            ],
+            "510310.SH": [
+                [
+                    candle("2026-07-21T10:15:00", 1000, "510310.SH", "ETF B"),
+                    candle("2026-07-21T10:30:00", 1100, "510310.SH", "ETF B"),
+                ],
+                [
+                    candle("2026-07-21T10:15:00", 1000, "510310.SH", "ETF B"),
+                    candle("2026-07-21T10:30:00", 1100, "510310.SH", "ETF B"),
+                ],
+            ],
+        }
+    )
+    notifier = RecordingNotifier()
+    app = create_app(
+        db_path=tmp_path / "alerts.db",
+        market_data_client=market_data,
+        scheduler_enabled=False,
+        settings=settings,
+        notifier=notifier,
+    )
+    client = TestClient(app)
+
+    first_response = client.post("/api/monitor/poll-all")
+    app.state.monitor_service.alert_store.save_notification_event_with_status(
+        symbol=service_module.ALERT_BATCH_SYMBOL,
+        candle_time=alert_time,
+        event_type="alert_batch",
+    )
+    with app.state.monitor_service.alert_store._connect() as connection:
+        connection.execute(
+            """
+            UPDATE notification_events
+            SET created_at = '2026-07-21 02:00:00'
+            WHERE symbol = ? AND candle_time = ? AND event_type = 'alert_batch'
+            """,
+            (service_module.ALERT_BATCH_SYMBOL, alert_time.isoformat()),
+        )
+    second_response = client.post("/api/monitor/poll-all")
+    third_response = client.post("/api/monitor/poll-all")
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert third_response.status_code == 200
+    assert len(notifier.no_anomaly_batches) == 1
+    assert len(notifier.alert_batches) == 1
+    assert [alert.symbol for alert in notifier.alert_batches[0]] == ["159915.SZ"]
+    assert notifier.alert_batches[0][0].candle_time == alert_time
+
+
+def test_poll_all_waits_before_sending_no_anomaly_then_sends_late_alert(
+    monkeypatch, tmp_path
+):
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 7, 21, 10, 31)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current.replace(tzinfo=tz)
+
+    monkeypatch.setattr(service_module, "datetime", FrozenDateTime)
+    settings = Settings(
+        symbols=[
+            EtfSymbolConfig(symbol="159915.SZ", name="ETF A"),
+            EtfSymbolConfig(symbol="510310.SH", name="ETF B"),
+        ],
+        no_anomaly_confirmation_delay_seconds=240,
+    )
+    alert_time = datetime.fromisoformat("2026-07-21T10:30:00")
+    market_data = StatefulMarketDataClient(
+        {
+            "159915.SZ": [
+                [
+                    candle("2026-07-21T10:15:00", 1000, "159915.SZ", "ETF A"),
+                    candle("2026-07-21T10:30:00", 1100, "159915.SZ", "ETF A"),
+                ],
+                [
+                    candle("2026-07-21T10:15:00", 1000, "159915.SZ", "ETF A"),
+                    candle("2026-07-21T10:30:00", 1500, "159915.SZ", "ETF A"),
+                ],
+            ],
+            "510310.SH": [
+                [
+                    candle("2026-07-21T10:15:00", 1000, "510310.SH", "ETF B"),
+                    candle("2026-07-21T10:30:00", 1100, "510310.SH", "ETF B"),
+                ],
+                [
+                    candle("2026-07-21T10:15:00", 1000, "510310.SH", "ETF B"),
+                    candle("2026-07-21T10:30:00", 1100, "510310.SH", "ETF B"),
+                ],
+            ],
+        }
+    )
+    notifier = RecordingNotifier()
+    app = create_app(
+        db_path=tmp_path / "alerts.db",
+        market_data_client=market_data,
+        scheduler_enabled=False,
+        settings=settings,
+        notifier=notifier,
+    )
+    client = TestClient(app)
+
+    first_response = client.post("/api/monitor/poll-all")
+    FrozenDateTime.current = datetime(2026, 7, 21, 10, 32)
+    second_response = client.post("/api/monitor/poll-all")
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert notifier.no_anomaly_batches == []
+    assert len(notifier.alert_batches) == 1
+    assert [alert.symbol for alert in notifier.alert_batches[0]] == ["159915.SZ"]
+    assert notifier.alert_batches[0][0].candle_time == alert_time
+
+
+def test_poll_all_does_not_resend_late_alert_after_current_alert_batch(tmp_path):
+    settings = Settings(
+        symbols=[
+            EtfSymbolConfig(symbol="159915.SZ", name="ETF A"),
+            EtfSymbolConfig(symbol="510310.SH", name="ETF B"),
+        ]
+    )
+    alert_time = datetime.fromisoformat("2026-07-21T10:30:00")
+    market_data = StatefulMarketDataClient(
+        {
+            "159915.SZ": [
+                [
+                    candle("2026-07-21T10:15:00", 1000, "159915.SZ", "ETF A"),
+                    candle("2026-07-21T10:30:00", 1100, "159915.SZ", "ETF A"),
+                ],
+                [
+                    candle("2026-07-21T10:15:00", 1000, "159915.SZ", "ETF A"),
+                    candle("2026-07-21T10:30:00", 1500, "159915.SZ", "ETF A"),
+                ],
+            ],
+            "510310.SH": [
+                [
+                    candle("2026-07-21T10:15:00", 1000, "510310.SH", "ETF B"),
+                    candle("2026-07-21T10:30:00", 1100, "510310.SH", "ETF B"),
+                ],
+                [
+                    candle("2026-07-21T10:15:00", 1000, "510310.SH", "ETF B"),
+                    candle("2026-07-21T10:30:00", 1100, "510310.SH", "ETF B"),
+                ],
+            ],
+        }
+    )
+    notifier = RecordingNotifier()
+    app = create_app(
+        db_path=tmp_path / "alerts.db",
+        market_data_client=market_data,
+        scheduler_enabled=False,
+        settings=settings,
+        notifier=notifier,
+    )
+    client = TestClient(app)
+
+    first_response = client.post("/api/monitor/poll-all")
+    second_response = client.post("/api/monitor/poll-all")
+    third_response = client.post("/api/monitor/poll-all")
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert third_response.status_code == 200
+    assert len(notifier.no_anomaly_batches) == 1
+    assert len(notifier.alert_batches) == 1
+    assert notifier.alert_batches[0][0].candle_time == alert_time
+
+
+def test_poll_all_does_not_send_stale_alert_batch_after_restart(monkeypatch, tmp_path):
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 7, 21, 13, 13, tzinfo=tz)
+
+    monkeypatch.setattr(service_module, "datetime", FrozenDateTime)
+    settings = Settings(
+        symbols=[
+            EtfSymbolConfig(symbol="159915.SZ", name="ETF A"),
+            EtfSymbolConfig(symbol="510310.SH", name="ETF B"),
+        ],
+        batch_notification_max_lag_seconds=900,
+    )
+    market_data = SymbolAwareMarketDataClient(
+        candles_by_symbol={
+            "159915.SZ": [
+                candle("2026-07-21T11:15:00", 1000, "159915.SZ", "ETF A"),
+                candle("2026-07-21T11:30:00", 1800, "159915.SZ", "ETF A"),
+            ],
+            "510310.SH": [
+                candle("2026-07-21T11:15:00", 1000, "510310.SH", "ETF B"),
+                candle("2026-07-21T11:30:00", 1000, "510310.SH", "ETF B"),
+            ],
+        }
+    )
+    notifier = RecordingNotifier()
+    app = create_app(
+        db_path=tmp_path / "alerts.db",
+        market_data_client=market_data,
+        scheduler_enabled=False,
+        settings=settings,
+        notifier=notifier,
+    )
+    client = TestClient(app)
+
+    response = client.post("/api/monitor/poll-all")
+
+    assert response.status_code == 200
+    assert notifier.alert_batches == []
+    assert notifier.no_anomaly_batches == []
+
+
+def test_poll_all_does_not_wait_for_delayed_first_candle_before_it_is_due(tmp_path):
+    settings = Settings(
+        symbols=[
+            EtfSymbolConfig(symbol="159915.SZ", name="ETF A"),
+            EtfSymbolConfig(symbol="510300.SH", name="ETF B"),
+            EtfSymbolConfig(symbol="513310.SH", name="ETF C"),
+        ],
+        symbol_first_candle_times={"513310.SH": time(10, 45)},
+    )
+    market_data = SymbolAwareMarketDataClient(
+        candles_by_symbol={
+            "159915.SZ": prior_day_candles(symbol="159915.SZ", name="ETF A")
+            + [
+                candle("2026-07-21T09:45:00", 1000, "159915.SZ", "ETF A"),
+                candle("2026-07-21T10:00:00", 1100, "159915.SZ", "ETF A"),
+            ],
+            "510300.SH": prior_day_candles(symbol="510300.SH", name="ETF B")
+            + [
+                candle("2026-07-21T09:45:00", 1000, "510300.SH", "ETF B"),
+                candle("2026-07-21T10:00:00", 1100, "510300.SH", "ETF B"),
+            ],
+            "513310.SH": [
+                candle("2026-07-20T14:45:00", 1000, "513310.SH", "ETF C"),
+                candle("2026-07-20T15:00:00", 1100, "513310.SH", "ETF C"),
+            ],
+        }
+    )
+    notifier = RecordingNotifier()
+    app = create_app(
+        db_path=tmp_path / "alerts.db",
+        market_data_client=market_data,
+        scheduler_enabled=False,
+        settings=settings,
+        notifier=notifier,
+    )
+    client = TestClient(app)
+
+    response = client.post("/api/monitor/poll-all")
+
+    assert response.status_code == 200
+    assert notifier.alert_batches == []
+    assert len(notifier.no_anomaly_batches) == 1
+    candles, _ = notifier.no_anomaly_batches[0]
+    assert [item.symbol for item in candles] == ["159915.SZ", "510300.SH"]
+    assert all(
+        item.time == datetime.fromisoformat("2026-07-21T10:00:00")
+        for item in candles
+    )
+
+
+def test_poll_all_ignores_delayed_symbol_error_before_its_first_candle_is_due(
+    tmp_path,
+):
+    settings = Settings(
+        symbols=[
+            EtfSymbolConfig(symbol="159915.SZ", name="ETF A"),
+            EtfSymbolConfig(symbol="510300.SH", name="ETF B"),
+            EtfSymbolConfig(symbol="513310.SH", name="ETF C"),
+        ],
+        symbol_first_candle_times={"513310.SH": time(10, 45)},
+    )
+    market_data = SymbolErrorMarketDataClient(
+        candles_by_symbol={
+            "159915.SZ": prior_day_candles(symbol="159915.SZ", name="ETF A")
+            + [
+                candle("2026-07-21T09:45:00", 1000, "159915.SZ", "ETF A"),
+                candle("2026-07-21T10:00:00", 1100, "159915.SZ", "ETF A"),
+            ],
+            "510300.SH": prior_day_candles(symbol="510300.SH", name="ETF B")
+            + [
+                candle("2026-07-21T09:45:00", 1000, "510300.SH", "ETF B"),
+                candle("2026-07-21T10:00:00", 1100, "510300.SH", "ETF B"),
+            ],
+        },
+        error_symbols={"513310.SH"},
+    )
+    notifier = RecordingNotifier()
+    app = create_app(
+        db_path=tmp_path / "alerts.db",
+        market_data_client=market_data,
+        scheduler_enabled=False,
+        settings=settings,
+        notifier=notifier,
+    )
+    client = TestClient(app)
+
+    response = client.post("/api/monitor/poll-all")
+
+    assert response.status_code == 200
+    assert len(notifier.no_anomaly_batches) == 1
+    candles, _ = notifier.no_anomaly_batches[0]
+    assert [item.symbol for item in candles] == ["159915.SZ", "510300.SH"]
+
+
+def test_poll_all_waits_for_delayed_symbol_after_its_first_candle_is_due(tmp_path):
+    settings = Settings(
+        symbols=[
+            EtfSymbolConfig(symbol="159915.SZ", name="ETF A"),
+            EtfSymbolConfig(symbol="510300.SH", name="ETF B"),
+            EtfSymbolConfig(symbol="513310.SH", name="ETF C"),
+        ],
+        symbol_first_candle_times={"513310.SH": time(10, 45)},
+    )
+    market_data = SymbolAwareMarketDataClient(
+        candles_by_symbol={
+            "159915.SZ": prior_day_candles(symbol="159915.SZ", name="ETF A")
+            + [
+                candle("2026-07-21T10:30:00", 1000, "159915.SZ", "ETF A"),
+                candle("2026-07-21T10:45:00", 1100, "159915.SZ", "ETF A"),
+            ],
+            "510300.SH": prior_day_candles(symbol="510300.SH", name="ETF B")
+            + [
+                candle("2026-07-21T10:30:00", 1000, "510300.SH", "ETF B"),
+                candle("2026-07-21T10:45:00", 1100, "510300.SH", "ETF B"),
+            ],
+            "513310.SH": [
+                candle("2026-07-20T14:45:00", 1000, "513310.SH", "ETF C"),
+                candle("2026-07-20T15:00:00", 1100, "513310.SH", "ETF C"),
+            ],
+        }
+    )
+    notifier = RecordingNotifier()
+    app = create_app(
+        db_path=tmp_path / "alerts.db",
+        market_data_client=market_data,
+        scheduler_enabled=False,
+        settings=settings,
+        notifier=notifier,
+    )
+    client = TestClient(app)
+
+    response = client.post("/api/monitor/poll-all")
+
+    assert response.status_code == 200
+    assert notifier.alert_batches == []
+    assert notifier.no_anomaly_batches == []
 
 
 def test_poll_all_sends_daily_summary_after_close_once_even_without_alerts(tmp_path):
@@ -497,11 +878,17 @@ def test_poll_detects_intraday_spike_even_when_latest_candle_is_normal(tmp_path)
             candle("2026-07-21T11:15:00", 95_000_000, symbol=symbol, name=name),
         ]
     )
+    settings = Settings(
+        opening_volume_ratio_threshold=2.0,
+        volume_ratio_threshold=2.0,
+        late_session_volume_ratio_threshold=2.0,
+    )
     notifier = RecordingNotifier()
     app = create_app(
         db_path=tmp_path / "alerts.db",
         market_data_client=market_data,
         scheduler_enabled=False,
+        settings=settings,
         notifier=notifier,
     )
     client = TestClient(app)
@@ -546,6 +933,9 @@ def test_poll_ignores_intraday_shrink_and_sends_no_anomaly_for_latest_candle(tmp
         ]
     )
     settings = Settings(
+        opening_volume_ratio_threshold=2.0,
+        volume_ratio_threshold=2.0,
+        late_session_volume_ratio_threshold=2.0,
         volume_shrink_ratio_threshold=0.4,
         median_shrink_multiplier_threshold=0,
     )
@@ -701,6 +1091,70 @@ def test_snapshot_returns_only_latest_trading_day_candles(tmp_path):
         "2026-07-20T09:45:00",
         "2026-07-20T10:00:00",
     ]
+
+
+def test_snapshot_waits_for_completion_delay_before_using_boundary_candle(
+    monkeypatch, tmp_path
+):
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 8, 7, 11, 1, tzinfo=tz)
+
+    monkeypatch.setattr(service_module, "datetime", FrozenDateTime)
+    app = create_app(
+        db_path=tmp_path / "alerts.db",
+        market_data_client=FakeMarketDataClient(
+            candles=[
+                candle("2026-08-07T10:45:00", 465_143_262),
+                candle("2026-08-07T11:00:00", 4_480_932),
+            ]
+        ),
+        scheduler_enabled=False,
+        settings=Settings(candle_completion_delay_seconds=180),
+    )
+    client = TestClient(app)
+
+    response = client.get("/api/monitor/snapshot?symbol=159915.SZ")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["latest_candle"]["time"] == "2026-08-07T10:45:00"
+    assert [item["time"] for item in body["candles"]] == ["2026-08-07T10:45:00"]
+
+
+def test_snapshot_filters_unfinished_cached_candle_when_live_source_fails(
+    monkeypatch, tmp_path
+):
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 8, 7, 11, 27, tzinfo=tz)
+
+    db_path = tmp_path / "alerts.db"
+    store = AlertStore(db_path)
+    store.save_candles(
+        [
+            candle("2026-08-07T10:45:00", 465_143_262),
+            candle("2026-08-07T11:30:00", 64_432_767),
+        ]
+    )
+    monkeypatch.setattr(service_module, "datetime", FrozenDateTime)
+    app = create_app(
+        db_path=db_path,
+        market_data_client=FakeMarketDataClient(error=RuntimeError("akshare failed")),
+        scheduler_enabled=False,
+        settings=Settings(candle_completion_delay_seconds=180),
+    )
+    client = TestClient(app)
+
+    response = client.get("/api/monitor/snapshot?symbol=159915.SZ")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["data_status"] == "cached"
+    assert body["latest_candle"]["time"] == "2026-08-07T10:45:00"
+    assert [item["time"] for item in body["candles"]] == ["2026-08-07T10:45:00"]
 
 
 def test_snapshot_hides_previous_day_candles_before_first_candle(monkeypatch, tmp_path):

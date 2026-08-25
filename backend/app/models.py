@@ -31,8 +31,8 @@ class AlertCreate(BaseModel):
     name: str
     alert_type: AlertType = "volume_spike"
     candle_time: datetime
-    volume: int
-    prev_volume: int
+    volume: float
+    prev_volume: float
     ratio: float
     threshold: float
     severity: Severity

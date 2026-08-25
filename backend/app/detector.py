@@ -21,19 +21,13 @@ def detect_volume_spike(candles: list[Candle], settings: Settings) -> AlertCreat
         previous = _previous_trading_day_same_slot_candle(ordered_all, current)
         return _detect_spike_against_previous(current, previous, settings)
 
-    previous = _previous_same_day_candle(ordered, current)
-    if previous is None:
-        return None
-
-    alert = _detect_spike_against_previous(current, previous, settings)
+    same_day_previous = _previous_same_day_candle(ordered, current)
+    alert = _detect_spike_against_previous(current, same_day_previous, settings)
     if alert is not None:
         return alert
 
-    if settings.is_late_session(current.time):
-        previous = _previous_trading_day_same_slot_candle(ordered_all, current)
-        return _detect_spike_against_previous(current, previous, settings)
-
-    return None
+    previous_day_same_slot = _previous_trading_day_same_slot_candle(ordered_all, current)
+    return _detect_spike_against_previous(current, previous_day_same_slot, settings)
 
 
 def _detect_spike_against_previous(
@@ -41,10 +35,10 @@ def _detect_spike_against_previous(
     previous: Candle | None,
     settings: Settings,
 ) -> AlertCreate | None:
-    if previous is None or previous.volume <= 0:
+    if previous is None or previous.amount <= 0:
         return None
 
-    ratio = current.volume / previous.volume
+    ratio = current.amount / previous.amount
 
     spike = _detect_spike(ratio, settings, current.time)
     if spike:
@@ -90,21 +84,21 @@ def _alert(
         previous_label = f"前一根 {previous.time:%H:%M}"
     if alert_type == "volume_shrink":
         message = (
-            f"{current.symbol} {period_label}（{current_period}）成交量缩至{previous_label} "
-            f"{rounded_ratio:.2f} 倍，当前量 {current.volume}，{previous_label}（{previous_period}） {previous.volume}"
+            f"{current.symbol} {period_label}（{current_period}）成交额缩至{previous_label} "
+            f"{rounded_ratio:.2f} 倍，当前额 {current.amount}，{previous_label}（{previous_period}） {previous.amount}"
         )
     else:
         message = (
-            f"{current.symbol} {period_label}（{current_period}）成交量放大 "
-            f"{rounded_ratio:.2f} 倍，当前量 {current.volume}，{previous_label}（{previous_period}） {previous.volume}"
+            f"{current.symbol} {period_label}（{current_period}）成交额放大 "
+            f"{rounded_ratio:.2f} 倍，当前额 {current.amount}，{previous_label}（{previous_period}） {previous.amount}"
         )
     return AlertCreate(
         symbol=current.symbol,
         name=current.name,
         alert_type=alert_type,
         candle_time=current.time,
-        volume=current.volume,
-        prev_volume=previous.volume,
+        volume=current.amount,
+        prev_volume=previous.amount,
         ratio=rounded_ratio,
         threshold=threshold,
         severity=severity,
