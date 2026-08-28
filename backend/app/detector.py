@@ -18,15 +18,17 @@ def detect_volume_spike(candles: list[Candle], settings: Settings) -> AlertCreat
 
     current = ordered[-1]
     if settings.is_opening_candle(current.time):
-        previous = _previous_trading_day_same_slot_candle(ordered_all, current)
+        previous = _previous_trading_day_same_slot_candle(ordered_all, current, settings)
         return _detect_spike_against_previous(current, previous, settings)
 
-    same_day_previous = _previous_same_day_candle(ordered, current)
+    same_day_previous = _previous_same_day_candle(ordered, current, settings)
     alert = _detect_spike_against_previous(current, same_day_previous, settings)
     if alert is not None:
         return alert
 
-    previous_day_same_slot = _previous_trading_day_same_slot_candle(ordered_all, current)
+    previous_day_same_slot = _previous_trading_day_same_slot_candle(
+        ordered_all, current, settings
+    )
     return _detect_spike_against_previous(current, previous_day_same_slot, settings)
 
 
@@ -75,9 +77,9 @@ def _alert(
     settings: Settings,
 ) -> AlertCreate:
     alert_type, severity = detected
-    period_label = f"{settings.kline_period_for(current.time)}分钟"
-    current_period = _kline_period_label(current.time, settings)
-    previous_period = _kline_period_label(previous.time, settings)
+    period_label = f"{_effective_kline_period(current, settings)}分钟"
+    current_period = _kline_period_label(current, settings)
+    previous_period = _kline_period_label(previous, settings)
     if current.time.date() != previous.time.date():
         previous_label = f"前一交易日同一时间点 {previous.time:%H:%M}"
     else:
@@ -109,6 +111,7 @@ def _alert(
 def _previous_trading_day_same_slot_candle(
     candles,
     current,
+    settings: Settings,
 ):
     """Find the same time on the most recent prior trading day."""
     previous_dates = sorted(
@@ -122,27 +125,40 @@ def _previous_trading_day_same_slot_candle(
         item
         for item in candles
         if item.time.date() == previous_date and item.time.time() == current.time.time()
-        and item.kline_period == current.kline_period
+        and _same_effective_kline_period(item, current, settings)
     ]
     if not matches:
         return None
     return matches[-1]
 
 
-def _previous_same_day_candle(candles, current):
+def _previous_same_day_candle(candles, current, settings: Settings):
     matches = [
         item
         for item in candles
         if item.time.date() == current.time.date()
         and item.time < current.time
-        and item.kline_period == current.kline_period
+        and _same_effective_kline_period(item, current, settings)
     ]
     if not matches:
         return None
     return matches[-1]
 
 
-def _kline_period_label(candle_time, settings: Settings) -> str:
-    period = int(settings.kline_period_for(candle_time))
-    end_time = candle_time + timedelta(minutes=period)
-    return f"{candle_time:%H:%M}-{end_time:%H:%M}"
+def _kline_period_label(candle: Candle, settings: Settings) -> str:
+    period = int(_effective_kline_period(candle, settings))
+    end_time = candle.time + timedelta(minutes=period)
+    return f"{candle.time:%H:%M}-{end_time:%H:%M}"
+
+
+def _same_effective_kline_period(left: Candle, right: Candle, settings: Settings) -> bool:
+    return _effective_kline_period(left, settings) == _effective_kline_period(
+        right, settings
+    )
+
+
+def _effective_kline_period(candle: Candle, settings: Settings) -> str:
+    expected_period = settings.kline_period_for(candle.time)
+    if candle.time.time() == settings.late_session_start_time:
+        return candle.kline_period
+    return expected_period

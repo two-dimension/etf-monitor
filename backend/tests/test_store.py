@@ -5,7 +5,12 @@ from app.models import AlertCreate, Candle
 from app.store import AlertStore
 
 
-def candle(time: str, volume: int, amount: float | None = None) -> Candle:
+def candle(
+    time: str,
+    volume: int,
+    amount: float | None = None,
+    kline_period: str = "15",
+) -> Candle:
     return Candle(
         symbol="159915.SZ",
         name="创业板ETF易方达",
@@ -16,6 +21,7 @@ def candle(time: str, volume: int, amount: float | None = None) -> Candle:
         close=1.05,
         volume=volume,
         amount=amount if amount is not None else volume * 1.0,
+        kline_period=kline_period,
     )
 
 
@@ -259,6 +265,43 @@ def test_store_syncs_late_session_start_alert_against_same_day_previous_15m_cand
     assert saved_alert.volume == 1800
     assert saved_alert.prev_volume == 100
     assert saved_alert.ratio == 18.0
+
+
+def test_store_treats_1435_alert_sync_as_5m_not_previous_1430_15m(tmp_path):
+    store = AlertStore(tmp_path / "alerts.db")
+    candle_time = datetime.fromisoformat("2026-07-21T14:35:00")
+    store.save_alert(
+        AlertCreate(
+            symbol="159915.SZ",
+            name="创业板ETF易方达",
+            candle_time=candle_time,
+            volume=1400,
+            prev_volume=1000,
+            ratio=1.4,
+            threshold=1.3,
+            severity="warning",
+            message="partial late-session alert",
+        )
+    )
+
+    store.save_candles(
+        [
+            candle("2026-07-20T14:35:00", 1200, kline_period="5"),
+            candle("2026-07-21T14:30:00", 1000, kline_period="15"),
+            candle("2026-07-21T14:35:00", 1400),
+        ]
+    )
+
+    assert store.list_alerts("159915.SZ", limit=10) == []
+
+
+def test_store_normalizes_legacy_late_session_candles_to_5m(tmp_path):
+    store = AlertStore(tmp_path / "alerts.db")
+
+    store.save_candles([candle("2026-07-21T14:35:00", 1000)])
+
+    [saved_candle] = store.list_candles("159915.SZ", limit=10)
+    assert saved_candle.kline_period == "5"
 
 
 def test_store_syncs_regular_alert_against_previous_day_same_slot_when_intraday_ratio_misses_threshold(

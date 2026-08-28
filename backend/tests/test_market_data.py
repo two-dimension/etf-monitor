@@ -139,6 +139,7 @@ def test_akshare_client_combines_15m_main_session_with_5m_late_session(monkeypat
         for candle in candles
     ] == [
         ("2026-07-28T14:15:00", 1500, "15"),
+        ("2026-07-28T14:30:00", 500, "5"),
         ("2026-07-28T14:30:00", 3000, "15"),
         ("2026-07-28T14:35:00", 1000, "5"),
     ]

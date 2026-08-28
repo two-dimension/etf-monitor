@@ -67,7 +67,7 @@ class AkShareMarketDataClient:
                     (
                         _filter_frame_by_time(
                             late_frame,
-                            start_after=self.settings.late_session_start_time,
+                            start_at=self.settings.late_session_start_time,
                             end_at=time(15, 0),
                         ),
                         self.settings.late_session_kline_period,

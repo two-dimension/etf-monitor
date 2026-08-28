@@ -10,6 +10,9 @@ SAME_SLOT_COMPARISON_TIMES = {
     time(9, 45),
     time(13, 15),
 }
+LATE_SESSION_START_TIME = time(14, 30)
+MAIN_KLINE_PERIOD = "15"
+LATE_SESSION_KLINE_PERIOD = "5"
 
 
 class AlertStore:
@@ -296,7 +299,7 @@ class AlertStore:
                         candle.symbol,
                         candle.name,
                         candle.time.isoformat(),
-                        candle.kline_period,
+                        _effective_kline_period(candle),
                         candle.open,
                         candle.high,
                         candle.low,
@@ -410,7 +413,7 @@ class CandleCache:
                         candle.symbol,
                         candle.name,
                         candle.time.isoformat(),
-                        candle.kline_period,
+                        _effective_kline_period(candle),
                         candle.open,
                         candle.high,
                         candle.low,
@@ -453,7 +456,7 @@ class CandleCache:
 
 def _sync_alert_volumes(connection: sqlite3.Connection, candles: list[Candle]) -> None:
     seen = {
-        (candle.symbol, candle.time.isoformat(), candle.kline_period)
+        (candle.symbol, candle.time.isoformat(), _effective_kline_period(candle))
         for candle in candles
     }
     for symbol, candle_time, kline_period in seen:
@@ -503,7 +506,7 @@ def _sync_alert_volumes(connection: sqlite3.Connection, candles: list[Candle]) -
             SET volume = ?,
                 prev_volume = ?,
                 ratio = ?,
-                message = symbol || ' 15分钟成交额放大 ' || printf('%.2f', ?)
+                message = symbol || ' ' || ? || '分钟成交额放大 ' || printf('%.2f', ?)
                     || ' 倍，当前额 ' || ? || '，' || ? || ' ' || ?
             WHERE symbol = ? AND candle_time = ? AND alert_type = 'volume_spike'
             """,
@@ -511,6 +514,7 @@ def _sync_alert_volumes(connection: sqlite3.Connection, candles: list[Candle]) -
                 volume,
                 prev_volume,
                 ratio,
+                kline_period,
                 ratio,
                 volume,
                 comparison_label,
@@ -640,6 +644,12 @@ def _meets_alert_sync_threshold(
 
 def _uses_previous_trading_day_same_slot(candle_time: datetime) -> bool:
     return candle_time.time() in SAME_SLOT_COMPARISON_TIMES
+
+
+def _effective_kline_period(candle: Candle) -> str:
+    if candle.time.time() > LATE_SESSION_START_TIME:
+        return LATE_SESSION_KLINE_PERIOD
+    return candle.kline_period
 
 
 def _alert_from_row(row: sqlite3.Row) -> AlertLog:

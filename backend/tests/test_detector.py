@@ -11,6 +11,7 @@ def candle(
     amount: float | None = None,
     open_price: float = 1.0,
     close_price: float = 1.05,
+    kline_period: str = "15",
 ) -> Candle:
     return Candle(
         symbol="159915.SZ",
@@ -22,6 +23,7 @@ def candle(
         close=close_price,
         volume=volume,
         amount=amount if amount is not None else volume * 1.0,
+        kline_period=kline_period,
     )
 
 
@@ -318,16 +320,19 @@ def test_does_not_mark_critical_when_shrink_breaks_critical_threshold():
 
 
 def test_uses_late_session_threshold_for_candles_after_late_session_start():
-    """A 1.3x spike at 14:35 should fire, but would not fire under the 2.0x day threshold."""
+    """A 1.3x spike at 14:35 should fire against the previous day same 5m slot."""
     settings = Settings(volume_ratio_threshold=2.0, median_multiplier_threshold=0)
     candles = [
-        candle("2026-07-21T14:30:00", 1000),
-        candle("2026-07-21T14:35:00", 1300),
+        candle("2026-07-20T14:35:00", 1000, kline_period="5"),
+        candle("2026-07-21T14:30:00", 1000, kline_period="15"),
+        candle("2026-07-21T14:30:00", 1000, kline_period="5"),
+        candle("2026-07-21T14:35:00", 1300, kline_period="5"),
     ]
     alert = detect_volume_spike(candles, settings)
     assert alert is not None
     assert alert.alert_type == "volume_spike"
     assert alert.candle_time == datetime.fromisoformat("2026-07-21T14:35:00")
+    assert alert.prev_volume == 1000
     assert alert.ratio == 1.3
     assert alert.threshold == 1.3
 
@@ -335,9 +340,9 @@ def test_uses_late_session_threshold_for_candles_after_late_session_start():
 def test_late_session_after_start_falls_back_to_previous_day_same_slot_when_sequential_ratio_is_below_threshold():
     settings = Settings(volume_ratio_threshold=2.0, median_multiplier_threshold=0)
     candles = [
-        candle("2026-07-20T14:35:00", 900),
+        candle("2026-07-20T14:35:00", 900, kline_period="5"),
         candle("2026-07-21T14:30:00", 1000),
-        candle("2026-07-21T14:35:00", 1200),
+        candle("2026-07-21T14:35:00", 1200, kline_period="5"),
     ]
     alert = detect_volume_spike(candles, settings)
     assert alert is not None
@@ -346,6 +351,34 @@ def test_late_session_after_start_falls_back_to_previous_day_same_slot_when_sequ
     assert alert.prev_volume == 900
     assert alert.ratio == 1.33
     assert alert.threshold == 1.3
+
+
+def test_late_session_does_not_compare_1435_5m_candle_to_1430_15m_candle():
+    settings = Settings(volume_ratio_threshold=1.3, median_multiplier_threshold=0)
+    candles = [
+        candle("2026-07-20T14:35:00", 1200, kline_period="5"),
+        candle("2026-07-21T14:30:00", 1000, kline_period="15"),
+        candle("2026-07-21T14:35:00", 1400, kline_period="5"),
+    ]
+
+    alert = detect_volume_spike(candles, settings)
+
+    assert alert is None
+
+
+def test_late_session_legacy_1435_candle_uses_time_based_5m_period():
+    settings = Settings(volume_ratio_threshold=1.3, median_multiplier_threshold=0)
+    candles = [
+        candle("2026-07-20T14:35:00", 900, kline_period="5"),
+        candle("2026-07-21T14:30:00", 1000, kline_period="15"),
+        candle("2026-07-21T14:35:00", 1200),
+    ]
+
+    alert = detect_volume_spike(candles, settings)
+
+    assert alert is not None
+    assert alert.prev_volume == 900
+    assert alert.ratio == 1.33
 
 
 def test_late_session_start_can_alert_from_regular_15m_ratio():
